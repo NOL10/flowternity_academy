@@ -14,20 +14,25 @@ import { Users, Clock, MapPin, ArrowRight, Zap, Flame } from 'lucide-react';
 
 export default function GamesPage() {
   const router = useRouter();
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
   const [games, setGames] = useState([]);
   const [sport, setSport] = useState('all');
-  const [loading, setLoading] = useState(true);
+  const [pageLoading, setPageLoading] = useState(true);
   const [busy, setBusy] = useState(null);
 
+  useEffect(() => {
+    if (!loading && !user) router.push('/auth?mode=login&next=/games');
+  }, [loading, user, router]);
+
   const load = async () => {
-    setLoading(true);
+    if (!user) return;
+    setPageLoading(true);
     const url = sport === 'all' ? '/api/games' : `/api/games?sport=${sport}`;
     const res = await fetch(url, { credentials: 'include' });
     if (res.ok) { const d = await res.json(); setGames(d.games || []); }
-    setLoading(false);
+    setPageLoading(false);
   };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sport]);
+  useEffect(() => { if (user) load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sport, user]);
 
   const join = async (gameId) => {
     if (!user) { router.push(`/auth?mode=login&next=/games`); return; }
@@ -48,6 +53,10 @@ export default function GamesPage() {
 
   const activeSports = SPORTS.filter(s => s.status === 'active');
   const groupedByDate = games.reduce((acc, g) => { (acc[g.date] = acc[g.date] || []).push(g); return acc; }, {});
+
+  if (loading || !user) return <div className="min-h-screen bg-background"><SiteNav /><div className="container py-20"><div className="animate-pulse h-32 bg-secondary rounded-2xl" /></div></div>;
+
+  const isParent = user.role === 'parent';
 
   return (
     <div className="min-h-screen bg-background">
@@ -84,7 +93,7 @@ export default function GamesPage() {
           ))}
         </div>
 
-        {loading ? (
+        {pageLoading ? (
           <div className="space-y-3">{[1,2,3].map(i => <div key={i} className="h-32 bg-secondary animate-pulse rounded-2xl" />)}</div>
         ) : Object.keys(groupedByDate).length === 0 ? (
           <Card className="p-12 rounded-3xl border-dashed text-center">
@@ -131,7 +140,7 @@ export default function GamesPage() {
                           {g.i_joined ? (
                             <Button onClick={() => leave(g.id)} disabled={busy === g.id} variant="outline" className="border-destructive text-destructive hover:bg-destructive/10">Leave</Button>
                           ) : (
-                            <Button onClick={() => join(g.id)} disabled={busy === g.id || isFull} className="bg-accent text-black hover:bg-accent/90">{busy === g.id ? 'Joining...' : isFull ? 'Full' : 'Join Game'}</Button>
+                            <Button onClick={() => join(g.id)} disabled={busy === g.id || isFull || isParent} className="bg-accent text-black hover:bg-accent/90">{busy === g.id ? 'Joining...' : isFull ? 'Full' : isParent ? 'Adults only' : 'Join Game'}</Button>
                           )}
                         </div>
                       </Card>
@@ -143,14 +152,14 @@ export default function GamesPage() {
           </div>
         )}
 
-        {!user && (
-          <Card className="mt-12 p-8 rounded-3xl bg-accent border-0">
+        {isParent && (
+          <Card className="mt-12 p-8 rounded-3xl bg-secondary border-dashed">
             <div className="flex flex-col sm:flex-row items-center justify-between gap-6">
               <div>
-                <h3 className="font-display font-black text-3xl text-black flex items-center gap-2"><Zap className="w-7 h-7" /> Sign up to play</h3>
-                <p className="text-black/70 mt-1">You need an active membership to join a game.</p>
+                <h3 className="font-display font-black text-2xl">Games are for adults only</h3>
+                <p className="text-muted-foreground mt-1">Your kid can book Classes on the Classes page. Games are pickup matches for adult members.</p>
               </div>
-              <Link href="/memberships"><Button size="lg" className="bg-black text-white hover:bg-black/90 h-12 px-8">Get Membership</Button></Link>
+              <Link href="/classes"><Button size="lg" className="bg-primary text-primary-foreground hover:bg-primary/90 h-12 px-8">Browse Classes</Button></Link>
             </div>
           </Card>
         )}

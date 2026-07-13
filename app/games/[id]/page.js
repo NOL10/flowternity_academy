@@ -14,18 +14,23 @@ import { ArrowLeft, Clock, Users, MapPin, Calendar as Cal } from 'lucide-react';
 export default function GameDetailPage() {
   const { id } = useParams();
   const router = useRouter();
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    if (!authLoading && !user) router.push(`/auth?mode=login&next=/games/${id}`);
+  }, [authLoading, user, router, id]);
+
   const load = async () => {
+    if (!user) return;
     setLoading(true);
     const res = await fetch(`/api/games/${id}`, { credentials: 'include' });
     if (res.ok) setData(await res.json());
     setLoading(false);
   };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id]);
+  useEffect(() => { if (user) load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id, user]);
 
   const join = async () => {
     if (!user) { router.push(`/auth?mode=login&next=/games/${id}`); return; }
@@ -43,10 +48,11 @@ export default function GameDetailPage() {
     setBusy(false);
   };
 
-  if (loading || !data) return <div className="min-h-screen bg-background"><SiteNav /><div className="container py-20"><div className="animate-pulse h-40 bg-secondary rounded-2xl" /></div></div>;
+  if (authLoading || !user || loading || !data) return <div className="min-h-screen bg-background"><SiteNav /><div className="container py-20"><div className="animate-pulse h-40 bg-secondary rounded-2xl" /></div></div>;
 
   const g = data.game;
   const isFull = data.participants.length >= g.max_players;
+  const isParent = user.role === 'parent';
 
   return (
     <div className="min-h-screen bg-background">
@@ -78,6 +84,11 @@ export default function GameDetailPage() {
             <div className="mt-6">
               {data.i_joined ? (
                 <Button onClick={leave} disabled={busy} variant="outline" size="lg" className="border-destructive text-destructive hover:bg-destructive/10 h-12">Leave Game</Button>
+              ) : isParent ? (
+                <div className="p-4 rounded-xl bg-secondary border-dashed border text-sm">
+                  <p className="font-semibold">Games are for adult members only.</p>
+                  <p className="text-muted-foreground mt-1">Your kid can book <Link href="/classes" className="underline">Classes</Link> instead.</p>
+                </div>
               ) : (
                 <Button onClick={join} disabled={busy || isFull} size="lg" className="bg-accent text-black hover:bg-accent/90 h-12 px-8">{busy ? 'Joining...' : isFull ? 'Game Full' : 'Join This Game'}</Button>
               )}

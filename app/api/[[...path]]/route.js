@@ -386,8 +386,9 @@ async function handleRoute(request, { params }) {
       return j({ coaches: list.map(clean) });
     }
 
-    // -------- GAMES (public browse, member join) --------
+    // -------- GAMES (login required; join is adult-only) --------
     if (route === '/games' && method === 'GET') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
       const url = new URL(request.url);
       const sport = url.searchParams.get('sport');
       const today = new Date().toISOString().slice(0, 10);
@@ -398,8 +399,7 @@ async function handleRoute(request, { params }) {
       const gameIds = games.map(g => g.id);
       const parts = gameIds.length ? await db.collection('game_participants').find({ game_id: { $in: gameIds } }).toArray() : [];
       const counts = parts.reduce((a, p) => (a[p.game_id] = (a[p.game_id] || 0) + 1, a), {});
-      const session = await getSession();
-      const mine = session ? new Set(parts.filter(p => p.user_id === session.sub).map(p => p.game_id)) : new Set();
+      const mine = new Set(parts.filter(p => p.user_id === auth.user.id).map(p => p.game_id));
 
       return j({
         games: games.map(g => ({
@@ -413,19 +413,19 @@ async function handleRoute(request, { params }) {
 
     const gameDetailMatch = route.match(/^\/games\/([^/]+)$/);
     if (gameDetailMatch && method === 'GET') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
       const game = await db.collection('games').findOne({ id: gameDetailMatch[1] });
       if (!game) return err('Game not found', 404);
       const parts = await db.collection('game_participants').find({ game_id: game.id }).toArray();
       const uids = parts.map(p => p.user_id);
       const users = uids.length ? await db.collection('users').find({ id: { $in: uids } }).toArray() : [];
-      const session = await getSession();
       return j({
         game: { ...clean(game), sport: SPORTS.find(s => s.id === game.sport_id) || null },
         participants: parts.map(p => {
           const u = users.find(x => x.id === p.user_id);
           return { user_id: p.user_id, name: u?.full_name || 'Player', joined_at: p.joined_at };
         }),
-        i_joined: session ? parts.some(p => p.user_id === session.sub) : false,
+        i_joined: parts.some(p => p.user_id === auth.user.id),
       });
     }
 
@@ -434,9 +434,12 @@ async function handleRoute(request, { params }) {
       const auth = await requireUser(); if (auth.error) return auth.error;
       const game = await db.collection('games').findOne({ id: gameJoinMatch[1] });
       if (!game) return err('Game not found', 404);
-      // Require any active membership (adult or otherwise)
+      // Games are ADULT-ONLY. Require an active adult membership.
       const um = await db.collection('user_memberships').findOne({ user_id: auth.user.id, status: 'active' });
-      if (!um) return err('You need an active membership to join a game.', 403);
+      if (!um) return err('You need an active adult membership to join a game.', 403);
+      if (um.membership_snapshot?.category !== 'adult') {
+        return err('Games are for adult members only. Kids memberships can book classes but not games.', 403);
+      }
       const already = await db.collection('game_participants').findOne({ game_id: game.id, user_id: auth.user.id });
       if (already) return err('You already joined this game', 409);
       const count = await db.collection('game_participants').countDocuments({ game_id: game.id });
