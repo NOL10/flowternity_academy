@@ -84,13 +84,8 @@ export default function ProfilePage() {
           <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6">
             <div className="relative">
               <Avatar className="w-24 h-24 border-4 border-background shadow">
-                {form.photo_url ? <AvatarImage src={form.photo_url} /> : null}
                 <AvatarFallback className="bg-accent text-black font-black text-2xl">{user.full_name?.[0]?.toUpperCase() || 'U'}</AvatarFallback>
               </Avatar>
-              <button onClick={() => fileRef.current?.click()} className="absolute -bottom-1 -right-1 w-9 h-9 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition">
-                {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
-              </button>
-              <input ref={fileRef} type="file" accept="image/*" hidden onChange={uploadPhoto} />
             </div>
             <div className="flex-1">
               <div className="flex items-center gap-2">

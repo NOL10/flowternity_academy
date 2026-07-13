@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getDb, clean } from '@/lib/flowternity/db';
 import { hashPassword, verifyPassword, createToken, setAuthCookie, clearAuthCookie, getSession } from '@/lib/flowternity/auth-server';
 import { SPORTS, MEMBERSHIPS, MAX_PAUSE_DAYS } from '@/lib/flowternity/config';
+import { sendPasswordResetEmail, sendWelcomeEmail, sendBookingConfirmationEmail, sendMembershipPurchaseEmail } from '@/lib/flowternity/email';
 
 function cors(res) {
   res.headers.set('Access-Control-Allow-Origin', process.env.CORS_ORIGINS || '*');
@@ -176,6 +177,12 @@ async function handleRoute(request, { params }) {
       };
       await db.collection('payments').insertOne(payment);
 
+      // Fire-and-forget email confirmation
+      await sendMembershipPurchaseEmail({
+        to: auth.user.email, name: auth.user.full_name,
+        membershipName: mem.name, months: mem.duration_months, price: mem.price, expiryDate: expiry
+      });
+
       return j({ user_membership: clean(um), payment: clean(payment) });
     }
 
@@ -287,6 +294,15 @@ async function handleRoute(request, { params }) {
         created_at: new Date(),
       };
       await db.collection('bookings').insertOne(booking);
+
+      // Booking confirmation email
+      const sport = SPORTS.find(s => s.id === cls.sport_id);
+      await sendBookingConfirmationEmail({
+        to: auth.user.email, name: auth.user.full_name,
+        sport: sport?.name || cls.sport_id,
+        date: cls.date, startTime: cls.start_time, endTime: cls.end_time, coach: cls.coach_name
+      });
+
       return j({ booking: clean(booking) });
     }
 
@@ -327,7 +343,7 @@ async function handleRoute(request, { params }) {
       return j({ ok: true, new_expiry: newExpiry });
     }
 
-    // -------- FORGOT / RESET PASSWORD (MVP: in-app link, no email) --------
+    // -------- FORGOT / RESET PASSWORD (Resend email + in-app link fallback) --------
     if (route === '/auth/forgot' && method === 'POST') {
       const { email } = await request.json();
       if (!email) return err('email required');
@@ -337,7 +353,10 @@ async function handleRoute(request, { params }) {
       const expires = new Date(Date.now() + 30 * 60 * 1000);
       await db.collection('password_resets').insertOne({ id: uuidv4(), user_id: u.id, token, expires, used: false, created_at: new Date() });
       const base = process.env.NEXT_PUBLIC_BASE_URL || '';
-      return j({ ok: true, reset_link: `${base}/reset?token=${token}`, token, message: 'MVP mode: use the link below (in real prod, this is emailed).' });
+      const resetLink = `${base}/reset?token=${token}`;
+      // Send email (best-effort; falls back to in-app link)
+      const emailResult = await sendPasswordResetEmail({ to: u.email, name: u.full_name, resetLink });
+      return j({ ok: true, reset_link: resetLink, token, email_sent: !!emailResult.data, email_error: emailResult.error || null, message: emailResult.data ? 'Reset link emailed to you. You can also use the link below.' : 'Use the link below to reset (email delivery failed).' });
     }
 
     if (route === '/auth/reset' && method === 'POST') {
@@ -427,6 +446,80 @@ async function handleRoute(request, { params }) {
       }
 
       // -------- Members --------
+      if (route === '/admin/members' && method === 'POST') {
+        // Admin creates new user (adult, parent, admin, or coach), optionally with membership.
+        const body = await request.json();
+        const { full_name, email, phone, role, password, membership_id, selected_sports, child } = body || {};
+        if (!full_name || !email) return err('full_name & email required');
+        const existing = await db.collection('users').findOne({ email: email.toLowerCase() });
+        if (existing) return err('Email already registered', 409);
+        const tempPassword = password && password.length >= 6 ? password : (Math.random().toString(36).slice(-4) + Math.random().toString(36).slice(-4)).toUpperCase();
+        const finalRole = ['admin', 'parent', 'adult', 'coach'].includes(role) ? role : 'adult';
+        const newUser = {
+          id: uuidv4(),
+          role: finalRole,
+          full_name, email: email.toLowerCase(), phone: phone || '',
+          address: '', emergency_contact: '', photo_url: '',
+          password_hash: hashPassword(tempPassword),
+          created_at: new Date(),
+          created_by_admin: auth.user.id,
+        };
+        await db.collection('users').insertOne(newUser);
+
+        let childProfile = null;
+        let membership = null;
+
+        // If child info provided (parent + kid), create child profile
+        if (finalRole === 'parent' && child && child.child_name && child.dob) {
+          childProfile = {
+            id: uuidv4(), parent_id: newUser.id,
+            child_name: child.child_name, dob: child.dob, gender: child.gender || '',
+            selected_sports: Array.isArray(child.selected_sports) ? child.selected_sports.slice(0, 2) : (Array.isArray(selected_sports) ? selected_sports.slice(0, 2) : []),
+            created_at: new Date(),
+          };
+          await db.collection('child_profiles').insertOne(childProfile);
+        }
+
+        // Optionally purchase a membership on behalf of the user
+        if (membership_id) {
+          const mem = MEMBERSHIPS.find(m => m.id === membership_id);
+          if (mem) {
+            const now = new Date();
+            const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
+            const um = {
+              id: uuidv4(),
+              user_id: newUser.id,
+              child_profile_id: mem.category === 'kids' && childProfile ? childProfile.id : null,
+              membership_id: mem.id,
+              membership_snapshot: mem,
+              selected_sports: Array.isArray(selected_sports) ? selected_sports.slice(0, mem.max_sports || 99) : (childProfile?.selected_sports || []),
+              start_date: now, expiry_date: expiry,
+              status: 'active', pause_days: 0, paused_at: null,
+              created_at: now, created_by_admin: auth.user.id,
+            };
+            await db.collection('user_memberships').insertOne(um);
+            await db.collection('payments').insertOne({
+              id: uuidv4(), user_id: newUser.id, amount: mem.price, currency: 'INR',
+              status: 'success', method: 'admin_created', ref: 'ADMIN_' + uuidv4().slice(0, 8).toUpperCase(),
+              membership_id: mem.id, user_membership_id: um.id, created_at: now
+            });
+            membership = um;
+          }
+        }
+
+        // Send welcome email with credentials
+        const emailResult = await sendWelcomeEmail({ to: newUser.email, name: newUser.full_name, tempPassword });
+
+        return j({
+          user: publicUser(newUser),
+          child_profile: childProfile ? clean(childProfile) : null,
+          membership: membership ? clean(membership) : null,
+          temp_password: tempPassword,
+          email_sent: !!emailResult.data,
+          email_error: emailResult.error || null,
+        });
+      }
+
       if (route === '/admin/members' && method === 'GET') {
         const url = new URL(request.url);
         const q = (url.searchParams.get('q') || '').toLowerCase().trim();

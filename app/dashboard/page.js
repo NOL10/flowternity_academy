@@ -19,7 +19,7 @@ export default function DashboardPage() {
   const { user, loading } = useAuth();
   const [data, setData] = useState(null);
   const [pauseOpen, setPauseOpen] = useState(false);
-  const [pauseDays, setPauseDays] = useState(7);
+  const [pauseDays, setPauseDays] = useState(30);
   const [loadingData, setLoadingData] = useState(true);
 
   const load = async () => {
@@ -184,7 +184,7 @@ export default function DashboardPage() {
       <Dialog open={pauseOpen} onOpenChange={setPauseOpen}>
         <DialogContent>
           <DialogHeader><DialogTitle>Pause your membership</DialogTitle></DialogHeader>
-          <p className="text-sm text-muted-foreground">Your membership expiry will be extended by the paused duration. You can only pause once per membership.</p>
+          <p className="text-sm text-muted-foreground">Your membership expiry will be extended by the paused duration. Standard pause is 30 days, and you can only pause once per membership.</p>
           <div>
             <Label>Pause duration (days, max 30)</Label>
             <Input type="number" min="1" max="30" value={pauseDays} onChange={e => setPauseDays(e.target.value)} className="mt-1 h-12" />

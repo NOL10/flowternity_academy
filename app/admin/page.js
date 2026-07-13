@@ -15,7 +15,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from 'sonner';
 import { useAuth } from '@/app/providers';
-import { SPORTS } from '@/lib/flowternity/config';
+import { SPORTS, MEMBERSHIPS as MEMBERSHIPS_LOCAL } from '@/lib/flowternity/config';
 import { Trash2, Plus, Users, Calendar, Activity, Sparkles, Search, CreditCard, Megaphone, UserCog, ClipboardList, CheckCircle2, XCircle, Save } from 'lucide-react';
 
 export default function AdminPage() {
@@ -173,6 +173,10 @@ function MembersTab() {
   const [q, setQ] = useState('');
   const [selected, setSelected] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newUser, setNewUser] = useState({ full_name: '', email: '', phone: '', role: 'adult', password: '', membership_id: '', selected_sports: [], child: { child_name: '', dob: '', gender: '' } });
+  const [createdResult, setCreatedResult] = useState(null);
 
   const load = async () => {
     const url = q ? `/api/admin/members?q=${encodeURIComponent(q)}` : '/api/admin/members';
@@ -200,10 +204,35 @@ function MembersTab() {
     if (res.ok) { toast.success('Deactivated'); setSelected(null); setDetail(null); load(); }
   };
 
+  const createMember = async (e) => {
+    e.preventDefault();
+    setCreating(true);
+    const payload = { ...newUser };
+    if (payload.role !== 'parent') delete payload.child;
+    if (!payload.membership_id) { delete payload.membership_id; delete payload.selected_sports; }
+    const res = await fetch('/api/admin/members', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (res.ok) {
+      toast.success('Member created' + (d.email_sent ? ' — welcome email sent' : ' (email failed)'));
+      setCreatedResult(d);
+      setNewUser({ full_name: '', email: '', phone: '', role: 'adult', password: '', membership_id: '', selected_sports: [], child: { child_name: '', dob: '', gender: '' } });
+      load();
+    } else toast.error(d.error || 'Failed');
+    setCreating(false);
+  };
+
+  const toggleNewSport = (id) => setNewUser(u => {
+    const cap = u.role === 'parent' ? 2 : 99;
+    if (u.selected_sports.includes(id)) return { ...u, selected_sports: u.selected_sports.filter(x => x !== id) };
+    if (u.selected_sports.length >= cap) { toast.error(`Max ${cap} sports`); return u; }
+    return { ...u, selected_sports: [...u.selected_sports, id] };
+  });
+
   return (
     <>
-      <div className="flex gap-3 mb-4">
+      <div className="flex gap-3 mb-4 items-end">
         <div className="relative flex-1 max-w-md"><Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" /><Input placeholder="Search by name, email, phone" value={q} onChange={e => setQ(e.target.value)} className="h-11 pl-9" /></div>
+        <Button onClick={() => setAddOpen(true)} className="bg-primary text-primary-foreground hover:bg-primary/90 h-11"><Plus className="w-4 h-4 mr-2" /> Add Member</Button>
       </div>
       {members.length === 0 ? (
         <Card className="p-8 rounded-2xl border-dashed text-center text-muted-foreground">No members found.</Card>
@@ -229,6 +258,101 @@ function MembersTab() {
           ))}
         </div>
       )}
+
+      <Dialog open={addOpen} onOpenChange={(o) => { setAddOpen(o); if (!o) setCreatedResult(null); }}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader><DialogTitle>Register a new member</DialogTitle></DialogHeader>
+          {createdResult ? (
+            <div className="space-y-4">
+              <Card className="p-4 rounded-xl bg-accent/10 border-accent">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="w-6 h-6 text-accent-foreground mt-0.5 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <h4 className="font-semibold">Account created</h4>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      {createdResult.email_sent ? 'A welcome email with credentials has been sent to the member.' : `Email delivery failed (${createdResult.email_error || 'unknown'}). Share the credentials manually.`}
+                    </p>
+                    <div className="mt-3 p-3 rounded-lg bg-background border font-mono text-sm">
+                      <div className="text-xs text-muted-foreground">Email</div>
+                      <div className="font-semibold">{createdResult.user.email}</div>
+                      <div className="text-xs text-muted-foreground mt-2">Temporary password</div>
+                      <div className="font-semibold">{createdResult.temp_password}</div>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+              <div className="flex gap-2 justify-end">
+                <Button variant="outline" onClick={() => { setCreatedResult(null); }}>Add another</Button>
+                <Button onClick={() => { setCreatedResult(null); setAddOpen(false); }} className="bg-primary text-primary-foreground hover:bg-primary/90">Done</Button>
+              </div>
+            </div>
+          ) : (
+            <form onSubmit={createMember} className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label>Role</Label>
+                  <Select value={newUser.role} onValueChange={v => setNewUser({ ...newUser, role: v, membership_id: '', selected_sports: [] })}>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="adult">Adult Member</SelectItem>
+                      <SelectItem value="parent">Parent (for kid)</SelectItem>
+                      <SelectItem value="coach">Coach</SelectItem>
+                      <SelectItem value="admin">Admin</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label>Password <span className="text-muted-foreground text-xs">(leave blank to auto-generate)</span></Label>
+                  <Input className="h-11 mt-1" placeholder="Auto-generated" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} />
+                </div>
+                <div><Label>Full Name</Label><Input required className="h-11 mt-1" value={newUser.full_name} onChange={e => setNewUser({ ...newUser, full_name: e.target.value })} /></div>
+                <div><Label>Email</Label><Input required type="email" className="h-11 mt-1" value={newUser.email} onChange={e => setNewUser({ ...newUser, email: e.target.value })} /></div>
+                <div className="col-span-2"><Label>Phone</Label><Input className="h-11 mt-1" value={newUser.phone} onChange={e => setNewUser({ ...newUser, phone: e.target.value })} /></div>
+              </div>
+
+              {newUser.role === 'parent' && (
+                <Card className="p-4 rounded-xl bg-secondary/40">
+                  <h4 className="font-semibold mb-2">Child details (optional)</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div><Label>Child name</Label><Input className="h-11 mt-1" value={newUser.child.child_name} onChange={e => setNewUser({ ...newUser, child: { ...newUser.child, child_name: e.target.value } })} /></div>
+                    <div><Label>DOB</Label><Input type="date" className="h-11 mt-1" value={newUser.child.dob} onChange={e => setNewUser({ ...newUser, child: { ...newUser.child, dob: e.target.value } })} /></div>
+                  </div>
+                </Card>
+              )}
+
+              {(newUser.role === 'adult' || newUser.role === 'parent') && (
+                <div>
+                  <Label>Attach membership (optional)</Label>
+                  <Select value={newUser.membership_id || 'none'} onValueChange={v => setNewUser({ ...newUser, membership_id: v === 'none' ? '' : v, selected_sports: [] })}>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue placeholder="No membership" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">No membership</SelectItem>
+                      {MEMBERSHIPS_LOCAL.filter(m => newUser.role === 'parent' ? m.category === 'kids' : m.category === 'adult').map(m => (
+                        <SelectItem key={m.id} value={m.id}>{m.name} · {m.duration_months}M · ₹{m.price.toLocaleString('en-IN')}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {newUser.membership_id && newUser.role === 'parent' && (
+                    <div className="mt-3">
+                      <p className="text-sm text-muted-foreground mb-2">Pick up to 2 sports for the kid</p>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {SPORTS.filter(s => s.status === 'active').map(s => (
+                          <button type="button" key={s.id} onClick={() => toggleNewSport(s.id)} className={`p-2 rounded-lg border text-sm ${newUser.selected_sports.includes(s.id) ? 'bg-primary text-primary-foreground border-primary' : ''}`}>{s.name}</button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <DialogFooter className="pt-4">
+                <Button type="button" variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button>
+                <Button type="submit" disabled={creating} className="bg-primary text-primary-foreground hover:bg-primary/90">{creating ? 'Creating...' : 'Create & Send Email'}</Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={!!selected} onOpenChange={o => { if (!o) { setSelected(null); setDetail(null); } }}>
         <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
