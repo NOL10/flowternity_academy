@@ -16,7 +16,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from 'sonner';
 import { useAuth } from '@/app/providers';
 import { SPORTS, MEMBERSHIPS as MEMBERSHIPS_LOCAL } from '@/lib/flowternity/config';
-import { Trash2, Plus, Users, Calendar, Activity, Sparkles, Search, CreditCard, Megaphone, UserCog, ClipboardList, CheckCircle2, XCircle, Save } from 'lucide-react';
+import { Trash2, Plus, Users, Calendar, Activity, Sparkles, Search, CreditCard, Megaphone, UserCog, ClipboardList, CheckCircle2, XCircle, Save, Flame } from 'lucide-react';
 
 export default function AdminPage() {
   const router = useRouter();
@@ -63,6 +63,7 @@ export default function AdminPage() {
         <Tabs value={tab} onValueChange={setTab} className="mt-10">
           <TabsList className="w-full flex-wrap h-auto p-1 gap-1">
             <TabsTrigger value="overview"><ClipboardList className="w-4 h-4 mr-2" />Classes</TabsTrigger>
+            <TabsTrigger value="games"><Flame className="w-4 h-4 mr-2" />Games</TabsTrigger>
             <TabsTrigger value="members"><Users className="w-4 h-4 mr-2" />Members</TabsTrigger>
             <TabsTrigger value="attendance"><CheckCircle2 className="w-4 h-4 mr-2" />Attendance</TabsTrigger>
             <TabsTrigger value="payments"><CreditCard className="w-4 h-4 mr-2" />Payments</TabsTrigger>
@@ -71,6 +72,7 @@ export default function AdminPage() {
           </TabsList>
 
           <TabsContent value="overview" className="mt-6"><ClassesTab /></TabsContent>
+          <TabsContent value="games" className="mt-6"><GamesTab /></TabsContent>
           <TabsContent value="members" className="mt-6"><MembersTab /></TabsContent>
           <TabsContent value="attendance" className="mt-6"><AttendanceTab /></TabsContent>
           <TabsContent value="payments" className="mt-6"><PaymentsTab /></TabsContent>
@@ -665,3 +667,107 @@ function AnnouncementsTab() {
     </div>
   );
 }
+
+// ---------------- GAMES TAB ----------------
+function GamesTab() {
+  const [games, setGames] = useState([]);
+  const [form, setForm] = useState({ sport_id: 'basketball', title: '', description: '', date: '', start_time: '', end_time: '', max_players: 10, host_name: 'Flowternity', skill_level: 'all_levels' });
+  const [saving, setSaving] = useState(false);
+
+  const load = async () => {
+    const d = await fetch('/api/admin/games', { credentials: 'include' }).then(r => r.json());
+    setGames(d.games || []);
+  };
+  useEffect(() => { load(); }, []);
+
+  const create = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    const res = await fetch('/api/admin/games', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify(form) });
+    const d = await res.json();
+    if (res.ok) { toast.success('Game scheduled'); setForm({ ...form, title: '', description: '', date: '', start_time: '', end_time: '' }); load(); }
+    else toast.error(d.error);
+    setSaving(false);
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Delete this game? All players will be removed.')) return;
+    const res = await fetch(`/api/admin/games/${id}`, { method: 'DELETE', credentials: 'include' });
+    if (res.ok) { toast.success('Deleted'); load(); }
+  };
+
+  return (
+    <div className="grid lg:grid-cols-3 gap-6">
+      <Card className="p-6 rounded-2xl">
+        <h2 className="font-display font-bold text-2xl mb-1">Schedule a Game</h2>
+        <p className="text-sm text-muted-foreground mb-4">Create a pickup game for members to join.</p>
+        <form onSubmit={create} className="space-y-3">
+          <div>
+            <Label>Sport</Label>
+            <Select value={form.sport_id} onValueChange={v => setForm({ ...form, sport_id: v })}>
+              <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {SPORTS.filter(s => s.status === 'active').map(s => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div><Label>Title <span className="text-muted-foreground text-xs">(optional)</span></Label><Input className="h-11 mt-1" value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} placeholder="Friday Night Hoops" /></div>
+          <div><Label>Description</Label><Textarea rows={2} value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} placeholder="Casual 5v5, all skill levels welcome" /></div>
+          <div><Label>Date</Label><Input type="date" required className="h-11 mt-1" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Start</Label><Input type="time" required className="h-11 mt-1" value={form.start_time} onChange={e => setForm({ ...form, start_time: e.target.value })} /></div>
+            <div><Label>End</Label><Input type="time" required className="h-11 mt-1" value={form.end_time} onChange={e => setForm({ ...form, end_time: e.target.value })} /></div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><Label>Max players</Label><Input type="number" min="2" required className="h-11 mt-1" value={form.max_players} onChange={e => setForm({ ...form, max_players: e.target.value })} /></div>
+            <div>
+              <Label>Skill level</Label>
+              <Select value={form.skill_level} onValueChange={v => setForm({ ...form, skill_level: v })}>
+                <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all_levels">All levels</SelectItem>
+                  <SelectItem value="beginner">Beginner</SelectItem>
+                  <SelectItem value="intermediate">Intermediate</SelectItem>
+                  <SelectItem value="advanced">Advanced</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div><Label>Host name</Label><Input className="h-11 mt-1" value={form.host_name} onChange={e => setForm({ ...form, host_name: e.target.value })} /></div>
+          <Button disabled={saving} type="submit" className="w-full h-11 bg-primary text-primary-foreground hover:bg-primary/90"><Plus className="w-4 h-4 mr-2" /> {saving ? 'Creating...' : 'Schedule Game'}</Button>
+        </form>
+      </Card>
+
+      <div className="lg:col-span-2">
+        <h2 className="font-display font-bold text-2xl mb-4">Upcoming Games</h2>
+        {games.length === 0 ? (
+          <Card className="p-8 rounded-2xl border-dashed text-center text-muted-foreground">No games scheduled yet.</Card>
+        ) : (
+          <div className="space-y-2">
+            {games.map(g => {
+              const sport = SPORTS.find(s => s.id === g.sport_id);
+              return (
+                <Card key={g.id} className="p-4 rounded-xl flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-lg bg-secondary flex flex-col items-center justify-center">
+                    <span className="text-[10px] uppercase text-muted-foreground">{new Date(g.date).toLocaleDateString('en-IN', { month: 'short' })}</span>
+                    <span className="font-display font-black">{new Date(g.date).getDate()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold truncate">{g.title}</span>
+                      <Badge variant="secondary" className="text-xs">{sport?.name}</Badge>
+                      <Badge variant="outline" className="text-xs">{g.start_time}–{g.end_time}</Badge>
+                    </div>
+                    <div className="text-sm text-muted-foreground">{g.participants_count}/{g.max_players} joined · Hosted by {g.host_name}</div>
+                  </div>
+                  <Button size="icon" variant="ghost" onClick={() => remove(g.id)}><Trash2 className="w-4 h-4" /></Button>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+

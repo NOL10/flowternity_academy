@@ -386,6 +386,73 @@ async function handleRoute(request, { params }) {
       return j({ coaches: list.map(clean) });
     }
 
+    // -------- GAMES (public browse, member join) --------
+    if (route === '/games' && method === 'GET') {
+      const url = new URL(request.url);
+      const sport = url.searchParams.get('sport');
+      const today = new Date().toISOString().slice(0, 10);
+      const filter = { date: { $gte: today } };
+      if (sport) filter.sport_id = sport;
+      const games = await db.collection('games').find(filter).sort({ date: 1, start_time: 1 }).limit(200).toArray();
+
+      const gameIds = games.map(g => g.id);
+      const parts = gameIds.length ? await db.collection('game_participants').find({ game_id: { $in: gameIds } }).toArray() : [];
+      const counts = parts.reduce((a, p) => (a[p.game_id] = (a[p.game_id] || 0) + 1, a), {});
+      const session = await getSession();
+      const mine = session ? new Set(parts.filter(p => p.user_id === session.sub).map(p => p.game_id)) : new Set();
+
+      return j({
+        games: games.map(g => ({
+          ...clean(g),
+          participants_count: counts[g.id] || 0,
+          sport: SPORTS.find(s => s.id === g.sport_id) || null,
+          i_joined: mine.has(g.id),
+        }))
+      });
+    }
+
+    const gameDetailMatch = route.match(/^\/games\/([^/]+)$/);
+    if (gameDetailMatch && method === 'GET') {
+      const game = await db.collection('games').findOne({ id: gameDetailMatch[1] });
+      if (!game) return err('Game not found', 404);
+      const parts = await db.collection('game_participants').find({ game_id: game.id }).toArray();
+      const uids = parts.map(p => p.user_id);
+      const users = uids.length ? await db.collection('users').find({ id: { $in: uids } }).toArray() : [];
+      const session = await getSession();
+      return j({
+        game: { ...clean(game), sport: SPORTS.find(s => s.id === game.sport_id) || null },
+        participants: parts.map(p => {
+          const u = users.find(x => x.id === p.user_id);
+          return { user_id: p.user_id, name: u?.full_name || 'Player', joined_at: p.joined_at };
+        }),
+        i_joined: session ? parts.some(p => p.user_id === session.sub) : false,
+      });
+    }
+
+    const gameJoinMatch = route.match(/^\/games\/([^/]+)\/join$/);
+    if (gameJoinMatch && method === 'POST') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
+      const game = await db.collection('games').findOne({ id: gameJoinMatch[1] });
+      if (!game) return err('Game not found', 404);
+      // Require any active membership (adult or otherwise)
+      const um = await db.collection('user_memberships').findOne({ user_id: auth.user.id, status: 'active' });
+      if (!um) return err('You need an active membership to join a game.', 403);
+      const already = await db.collection('game_participants').findOne({ game_id: game.id, user_id: auth.user.id });
+      if (already) return err('You already joined this game', 409);
+      const count = await db.collection('game_participants').countDocuments({ game_id: game.id });
+      if (count >= (game.max_players || 999)) return err('Game is full', 409);
+      const p = { id: uuidv4(), game_id: game.id, user_id: auth.user.id, joined_at: new Date() };
+      await db.collection('game_participants').insertOne(p);
+      return j({ ok: true, participant: clean(p) });
+    }
+
+    const gameLeaveMatch = route.match(/^\/games\/([^/]+)\/leave$/);
+    if (gameLeaveMatch && method === 'POST') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
+      await db.collection('game_participants').deleteOne({ game_id: gameLeaveMatch[1], user_id: auth.user.id });
+      return j({ ok: true });
+    }
+
     // -------- ADMIN --------
     if (route.startsWith('/admin/')) {
       const auth = await requireUser(); if (auth.error) return auth.error;
@@ -443,6 +510,50 @@ async function handleRoute(request, { params }) {
       if (annDel && method === 'DELETE') {
         await db.collection('announcements').deleteOne({ id: annDel[1] });
         return j({ ok: true });
+      }
+
+      // -------- Games (admin CRUD) --------
+      if (route === '/admin/games' && method === 'POST') {
+        const { sport_id, title, description, date, start_time, end_time, max_players, host_name, skill_level } = await request.json();
+        if (!sport_id || !date || !start_time || !end_time || !max_players) return err('Missing fields');
+        const g = {
+          id: uuidv4(),
+          sport_id,
+          title: title || `${SPORTS.find(s => s.id === sport_id)?.name || sport_id} Game`,
+          description: description || '',
+          date, start_time, end_time,
+          max_players: parseInt(max_players),
+          host_name: host_name || 'Flowternity',
+          skill_level: skill_level || 'all_levels',
+          created_at: new Date(),
+          created_by: auth.user.id,
+        };
+        await db.collection('games').insertOne(g);
+        return j({ game: clean(g) });
+      }
+
+      if (route === '/admin/games' && method === 'GET') {
+        const list = await db.collection('games').find({}).sort({ date: 1, start_time: 1 }).toArray();
+        const gameIds = list.map(g => g.id);
+        const parts = gameIds.length ? await db.collection('game_participants').find({ game_id: { $in: gameIds } }).toArray() : [];
+        const counts = parts.reduce((a, p) => (a[p.game_id] = (a[p.game_id] || 0) + 1, a), {});
+        return j({ games: list.map(g => ({ ...clean(g), participants_count: counts[g.id] || 0 })) });
+      }
+
+      const gameDel = route.match(/^\/admin\/games\/([^/]+)$/);
+      if (gameDel && method === 'DELETE') {
+        await db.collection('games').deleteOne({ id: gameDel[1] });
+        await db.collection('game_participants').deleteMany({ game_id: gameDel[1] });
+        return j({ ok: true });
+      }
+
+      const gameRosterMatch = route.match(/^\/admin\/games\/([^/]+)\/roster$/);
+      if (gameRosterMatch && method === 'GET') {
+        const gid = gameRosterMatch[1];
+        const parts = await db.collection('game_participants').find({ game_id: gid }).toArray();
+        const uids = parts.map(p => p.user_id);
+        const users = uids.length ? await db.collection('users').find({ id: { $in: uids } }).toArray() : [];
+        return j({ participants: parts.map(p => { const u = users.find(x => x.id === p.user_id); return { user_id: p.user_id, name: u?.full_name || 'Player', email: u?.email, phone: u?.phone, joined_at: p.joined_at }; }) });
       }
 
       // -------- Members --------

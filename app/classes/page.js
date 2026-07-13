@@ -20,7 +20,12 @@ export default function ClassesPage() {
   const [busyId, setBusyId] = useState(null);
   const [loadingList, setLoadingList] = useState(true);
 
+  useEffect(() => {
+    if (!loading && !user) router.push('/auth?mode=login&next=/classes');
+  }, [loading, user, router]);
+
   const load = async () => {
+    if (!user) return;
     setLoadingList(true);
     const url = sport === 'all' ? '/api/classes' : `/api/classes?sport=${sport}`;
     const res = await fetch(url, { credentials: 'include' });
@@ -28,7 +33,7 @@ export default function ClassesPage() {
     setLoadingList(false);
   };
 
-  useEffect(() => { load(); }, [sport]);
+  useEffect(() => { if (user) load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sport, user]);
 
   const book = async (id) => {
     if (!user) { router.push('/auth?mode=login&next=/classes'); return; }
@@ -42,6 +47,8 @@ export default function ClassesPage() {
 
   const groupedByDate = classes.reduce((acc, c) => { (acc[c.date] = acc[c.date] || []).push(c); return acc; }, {});
   const activeSports = SPORTS.filter(s => s.status === 'active');
+
+  if (loading || !user) return <div className="min-h-screen bg-background"><SiteNav /><div className="container py-20"><div className="animate-pulse h-32 bg-secondary rounded-2xl" /></div></div>;
 
   return (
     <div className="min-h-screen bg-background">

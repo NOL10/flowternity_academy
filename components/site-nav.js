@@ -15,6 +15,7 @@ export default function SiteNav({ dark = false }) {
   const links = [
     { href: '/', label: 'Home' },
     { href: '/memberships', label: 'Memberships' },
+    { href: '/games', label: 'Games' },
     { href: '/classes', label: 'Classes' },
     { href: '/coaches', label: 'Coaches' },
     { href: '/about', label: 'About' },
