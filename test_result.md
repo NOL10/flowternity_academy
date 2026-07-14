@@ -320,42 +320,157 @@ frontend:
 
 metadata:
   created_by: "main_agent"
-  version: "1.0"
-  test_sequence: 1
+  version: "1.2"
+  test_sequence: 3
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Trial (public book + list classes)"
+    - "Register + Pay combined endpoint"
+    - "Admin grant/extend/expire membership"
+    - "Admin refund payment"
+    - "Admin trial-leads list + status update"
+    - "Paginated /admin/members and /admin/payments"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
+backend_new:
+  - task: "Free trial endpoints"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "high"
+    stuck_count: 0
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          Two new public endpoints (no auth):
+          - GET /api/trial/classes?sport=SPORT_ID → returns upcoming classes with seats_left, enriched with sport object.
+          - POST /api/trial/book { full_name, email, phone, sport_id, class_id?, message? } → creates trial_leads doc.
+            Blocks duplicate within 30 days (409). If class_id provided, validates capacity (409 if full).
+            Sends booking confirmation email best-effort. Status is 'scheduled' if class picked, else 'pending'.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ ALL TESTS PASSED (9/9). Verified: GET /trial/classes returns 200 with classes array containing seats_left, sport object, and booked_count. Sport filter works correctly. POST /trial/book creates lead with valid data (returns lead, email_sent, class fields). Duplicate email within 30 days returns 409. Missing fields returns 400. Booking with class_id populates class object. Complete trial booking flow functional.
+
+  - task: "Register + Pay combined endpoint"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "high"
+    stuck_count: 0
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          POST /api/checkout/register-and-pay (public):
+          - Creates user (409 if email exists), creates child_profile (if kids membership),
+            creates user_membership + payment, sets auth cookie, sends purchase email best-effort.
+          - Validates kids membership requires role=parent + child info + at least 1 sport.
+          - Returns { user, user_membership, payment, child_profile? }.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ ALL TESTS PASSED (14/14). Verified: Adult flow creates user, membership, payment and sets auth cookie (GET /auth/me confirms cookie). Parent+Kid flow creates child_profile with selected_sports. Missing password returns 400. Missing membership_id returns 400. Kids membership without child info returns 400. Kids membership without selected_sports returns 400. Duplicate email returns 409. Invalid membership_id returns 400. Complete register+pay flow functional with proper validation.
+
+  - task: "Admin grant/extend/expire membership + refund payment"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "high"
+    stuck_count: 0
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          - POST /api/admin/members/:uid/grant-membership { membership_id, child_profile_id?, selected_sports?, note? } → creates active membership + 0-amount payment.
+          - POST /api/admin/memberships/:mid/extend { days, note? } → pushes to extensions array + updates expiry; reactivates expired if new expiry in future.
+          - POST /api/admin/memberships/:mid/expire → sets status=expired.
+          - POST /api/admin/payments/:pid/refund → status=refunded, expires linked user_membership.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ ALL TESTS PASSED (17/17). Verified: POST /admin/members/:uid/grant-membership creates active membership with payment method="admin_granted" and amount=0. Kids grant without child_profile_id returns 400. POST /admin/memberships/:mid/extend extends expiry by specified days (tested 15 days extension). Invalid days (0 or 400) return 400. POST /admin/memberships/:mid/expire sets status=expired. POST /admin/payments/:pid/refund marks payment as refunded and expires linked membership. Refunding same payment again returns 400. Refunding non-existent payment returns 404. Non-admin access returns 403. Complete admin membership management functional.
+
+  - task: "Admin trial-leads"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "medium"
+    stuck_count: 0
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          - GET /api/admin/trial-leads → list all trial leads enriched with sport_name and class.
+          - PATCH /api/admin/trial-leads/:id { status } → status ∈ pending|scheduled|attended|no_show|cancelled.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ ALL TESTS PASSED (6/6). Verified: GET /admin/trial-leads returns 200 with leads array. Each lead has sport_name field enriched from sport_id. PATCH /admin/trial-leads/:id with valid status (attended) returns 200. Invalid status returns 400. Admin trial-leads management functional.
+
+  - task: "Pagination"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    priority: "medium"
+    stuck_count: 0
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          GET /api/admin/members and GET /api/admin/payments now accept ?page (default 1) & ?limit (default 50, max 200).
+          Response includes total, page, limit. Search on /admin/members uses MongoDB regex now (case-insensitive) instead of client-side filter.
+      - working: true
+        agent: "testing"
+        comment: |
+          ✅ ALL TESTS PASSED (17/17). Verified: GET /admin/members?page=1&limit=5 returns 200 with members array (length <= 5), total, page, limit fields. GET /admin/members?q=admin performs case-insensitive search on name/email/phone using MongoDB regex. GET /admin/payments?page=1&limit=5 returns 200 with payments array (length <= 5), total, page, limit fields. Pagination and search working correctly.
+
 agent_communication:
   - agent: "main"
     message: |
-      Iteration 3 shipped:
-      - Resend email integration wired into: /api/auth/forgot (password reset), /api/checkout/mock (membership activation confirmation), /api/bookings (booking confirmation), and NEW /api/admin/members POST (welcome email w/ temp password when admin creates user).
-      - Email sending is best-effort — flows still succeed even if email fails (email_sent + email_error in responses).
-      - New endpoint: POST /api/admin/members creates a user (adult/parent/coach/admin), optionally purchases membership, optionally creates child profile for parents, sends welcome email with either provided or auto-generated temp password.
-      - Admin UI: "Add Member" button in Members tab → dialog with role selector, optional membership attach, kid details for parents, credentials shown on success + email delivery status.
-      - Pause membership default changed from 7 → 30 days.
-      - Photo upload removed from profile page (avatar fallback = first letter of name).
-      - Smoke-tested via curl: admin login OK, admin/members POST OK (email_sent:true), auth/forgot OK (email_sent:true).
+      Iteration 4 shipped — new "book a free class" flow + combined register+pay + admin manual membership tools.
+      READY FOR AUTOMATED BACKEND TESTING. Please test:
 
-      READY FOR AUTOMATED BACKEND TEST. Please test:
-      1) All prior scenarios (auth, config, checkout, dashboard, classes, bookings, pause/resume, admin CRUD, security)
-      2) NEW: POST /api/admin/members
-         - Adult: {full_name, email, phone, role:"adult", membership_id:"adult_3m"} → returns user + membership + temp_password + email_sent
-         - Parent: {full_name, email, phone, role:"parent", child:{child_name, dob, gender}, membership_id:"kids_1m", selected_sports:["basketball"]} → creates child_profile + kids membership tied to child
-         - With explicit password: {full_name, email, password:"custom123"} → uses provided password (verify by logging in)
-         - Duplicate email → 409
-         - Non-admin → 403
-      3) Verify emails are best-effort (don't fail request if Resend errors — hard to test without breaking key)
-      4) Confirm existing endpoints not broken by imports
+      1) Public trial endpoints:
+         - GET /api/trial/classes with & without sport filter → returns classes with seats_left.
+         - POST /api/trial/book with new email → 200, lead created. Same email again → 409 (30-day cooldown).
+         - Post with missing fields → 400. Post with class_id of full class → 409.
+
+      2) POST /api/checkout/register-and-pay:
+         - Adult: {full_name, email, password, phone, role:"adult", membership_id:"adult_3m"} → 200, sets cookie, GET /auth/me → returns user.
+         - Parent+Kid: {..., role:"parent", membership_id:"kids_1m", selected_sports:["basketball"], child:{child_name, dob}} → 200 + child_profile created.
+         - Missing fields → 400. Duplicate email → 409. Kids w/o child → 400. Kids w/o selected_sports → 400.
+
+      3) Admin grant/extend/expire/refund (requires admin login):
+         - POST /admin/members/:uid/grant-membership → creates active membership + payment with method="admin_granted".
+         - POST /admin/memberships/:mid/extend {days: 15} → expiry_date shifts by 15 days.
+         - POST /admin/memberships/:mid/expire → status=expired.
+         - POST /admin/payments/:pid/refund → status=refunded, linked membership expired.
+         - Non-admin → 403.
+
+      4) Trial-leads:
+         - GET /admin/trial-leads → list.
+         - PATCH /admin/trial-leads/:id {status:"attended"} → 200.
+
+      5) Pagination:
+         - GET /admin/members?page=1&limit=10 → includes total, page, limit.
+         - GET /admin/payments?page=1&limit=10 → includes total, page, limit.
+
+      6) Regression: all prior scenarios still working (auth, dashboard, bookings, existing checkout/mock, admin classes/coaches/announcements/attendance, etc.)
 
   - agent: "testing"
     message: |
-      ✅ COMPREHENSIVE BACKEND TEST COMPLETED - 98.4% PASS RATE (123/125 tests passed)
+      Previous iteration ✅ 123/125 backend tests passed. See history above.
       
       Test Results Summary:
       1. ✅ Health/Config (7/7) - All endpoints working
@@ -381,3 +496,52 @@ agent_communication:
       
       ALL CRITICAL BACKEND FUNCTIONALITY VERIFIED AND WORKING.
       Backend is production-ready for MVP launch.
+
+  - agent: "testing"
+    message: |
+      Iteration 4 Backend Testing Complete ✅ 70/70 tests passed (100% success rate)
+      
+      NEW ENDPOINTS TESTED:
+      1. ✅ Public Trial Endpoints (9/9):
+         - GET /trial/classes returns classes with seats_left, sport object, booked_count
+         - Sport filter works correctly
+         - POST /trial/book creates leads, enforces 30-day duplicate check (409)
+         - Missing fields validation (400)
+         - Class booking with class_id populates class object
+      
+      2. ✅ Register + Pay Combined (14/14):
+         - Adult flow: creates user, membership, payment, sets auth cookie
+         - Parent+Kid flow: creates child_profile with selected_sports
+         - All validation working: missing password (400), missing membership_id (400)
+         - Kids without child (400), kids without sports (400)
+         - Duplicate email (409), invalid membership_id (400)
+      
+      3. ✅ Admin Membership Management (17/17):
+         - Grant membership: creates active membership + payment (method="admin_granted", amount=0)
+         - Kids grant without child_profile_id returns 400
+         - Extend membership: expiry shifts by specified days (tested 15 days)
+         - Invalid days (0 or 400) return 400
+         - Expire membership: sets status=expired
+         - Refund payment: marks refunded, expires linked membership
+         - Duplicate refund returns 400, non-existent returns 404
+         - Non-admin access returns 403
+      
+      4. ✅ Admin Trial-Leads (6/6):
+         - GET /admin/trial-leads returns leads with sport_name enrichment
+         - PATCH status update works (tested "attended")
+         - Invalid status returns 400
+      
+      5. ✅ Pagination (17/17):
+         - GET /admin/members?page=1&limit=5 returns members, total, page, limit
+         - Search query (q=admin) performs case-insensitive MongoDB regex search
+         - GET /admin/payments?page=1&limit=5 returns payments, total, page, limit
+      
+      6. ✅ Regression Tests (7/7):
+         - All existing endpoints still working: /config, /auth/login, /auth/me
+         - /admin/classes, /admin/members, /dashboard, /checkout/mock
+      
+      SUMMARY:
+      All Iteration 4 features are fully functional with comprehensive validation.
+      No critical issues found. All new endpoints working as specified.
+      Regression tests confirm existing functionality remains intact.
+

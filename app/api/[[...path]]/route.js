@@ -133,9 +133,171 @@ async function handleRoute(request, { params }) {
       return j({ children: kids.map(clean) });
     }
 
+    // -------- FREE TRIAL (public, no auth) --------
+    if (route === '/trial/classes' && method === 'GET') {
+      const url = new URL(request.url);
+      const sport = url.searchParams.get('sport');
+      const today = new Date().toISOString().slice(0, 10);
+      const filter = { date: { $gte: today } };
+      if (sport) filter.sport_id = sport;
+      const classes = await db.collection('classes').find(filter).sort({ date: 1, start_time: 1 }).limit(30).toArray();
+      const classIds = classes.map(c => c.id);
+      const bookings = classIds.length ? await db.collection('bookings').find({ class_id: { $in: classIds }, status: 'booked' }).toArray() : [];
+      const counts = bookings.reduce((a, b) => (a[b.class_id] = (a[b.class_id] || 0) + 1, a), {});
+      return j({
+        classes: classes.map(c => ({
+          ...clean(c),
+          sport: SPORTS.find(s => s.id === c.sport_id) || null,
+          booked_count: counts[c.id] || 0,
+          seats_left: Math.max(0, c.capacity - (counts[c.id] || 0)),
+        })),
+      });
+    }
+
+    if (route === '/trial/book' && method === 'POST') {
+      const body = await request.json();
+      const { full_name, email, phone, sport_id, class_id, message } = body || {};
+      if (!full_name || !email || !phone || !sport_id) return err('full_name, email, phone, sport_id required');
+      const existingLead = await db.collection('trial_leads').findOne({
+        email: email.toLowerCase(),
+        created_at: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+      });
+      if (existingLead) return err('You have already booked a free class recently. Check your email or contact us.', 409);
+
+      let classInfo = null;
+      if (class_id) {
+        const cls = await db.collection('classes').findOne({ id: class_id });
+        if (!cls) return err('Selected class not found', 404);
+        const activeCount = await db.collection('bookings').countDocuments({ class_id, status: 'booked' });
+        if (activeCount >= cls.capacity) return err('That class is full — please pick another slot.', 409);
+        classInfo = cls;
+      }
+
+      const lead = {
+        id: uuidv4(),
+        full_name,
+        email: email.toLowerCase(),
+        phone,
+        sport_id,
+        class_id: class_id || null,
+        message: message || '',
+        status: class_id ? 'scheduled' : 'pending',
+        created_at: new Date(),
+      };
+      await db.collection('trial_leads').insertOne(lead);
+
+      // Best-effort confirmation email — reuse booking confirmation email if class picked
+      let email_sent = false;
+      try {
+        if (classInfo) {
+          const sport = SPORTS.find(s => s.id === classInfo.sport_id);
+          const r = await sendBookingConfirmationEmail({
+            to: lead.email, name: lead.full_name,
+            sport: sport?.name || classInfo.sport_id,
+            date: classInfo.date, startTime: classInfo.start_time, endTime: classInfo.end_time,
+            coach: classInfo.coach_name,
+          });
+          email_sent = !!r?.data;
+        }
+      } catch (e) { /* non-fatal */ }
+
+      return j({ lead: clean(lead), email_sent, class: classInfo ? clean(classInfo) : null });
+    }
+
+    // -------- REGISTER + PAY (combined signup) --------
+    if (route === '/checkout/register-and-pay' && method === 'POST') {
+      const body = await request.json();
+      const { full_name, email, password, phone, role, membership_id, selected_sports, child } = body || {};
+      if (!full_name || !email || !password || !membership_id) {
+        return err('full_name, email, password, membership_id are required');
+      }
+      if (password.length < 6) return err('Password must be 6+ chars');
+
+      const mem = MEMBERSHIPS.find(m => m.id === membership_id);
+      if (!mem) return err('Invalid membership');
+
+      const emailLower = email.toLowerCase();
+      const existing = await db.collection('users').findOne({ email: emailLower });
+      if (existing) return err('Email already registered — please sign in first, then buy a membership.', 409);
+
+      const isAdmin = emailLower === (process.env.ADMIN_EMAIL || '').toLowerCase();
+      const finalRole = isAdmin ? 'admin' : (role === 'parent' ? 'parent' : 'adult');
+
+      // Kids memberships require a parent role + child info
+      if (mem.category === 'kids') {
+        if (finalRole !== 'parent') return err('Kids memberships require a parent account. Select "Register as parent".');
+        if (!child || !child.child_name || !child.dob) return err('Child name & DOB required for kids memberships');
+        if (!Array.isArray(selected_sports) || selected_sports.length === 0) return err('Pick at least 1 sport for the kid');
+      }
+
+      const newUser = {
+        id: uuidv4(),
+        role: finalRole,
+        full_name,
+        email: emailLower,
+        phone: phone || '',
+        address: '', emergency_contact: '', photo_url: '',
+        password_hash: hashPassword(password),
+        created_at: new Date(),
+      };
+      await db.collection('users').insertOne(newUser);
+
+      let childProfile = null;
+      if (mem.category === 'kids') {
+        childProfile = {
+          id: uuidv4(), parent_id: newUser.id,
+          child_name: child.child_name, dob: child.dob, gender: child.gender || '',
+          selected_sports: selected_sports.slice(0, 2),
+          created_at: new Date(),
+        };
+        await db.collection('child_profiles').insertOne(childProfile);
+      }
+
+      const now = new Date();
+      const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
+      const um = {
+        id: uuidv4(),
+        user_id: newUser.id,
+        child_profile_id: childProfile ? childProfile.id : null,
+        membership_id: mem.id,
+        membership_snapshot: mem,
+        selected_sports: mem.category === 'kids' ? selected_sports.slice(0, 2) : (Array.isArray(selected_sports) ? selected_sports : []),
+        start_date: now, expiry_date: expiry,
+        status: 'active', pause_days: 0, paused_at: null,
+        created_at: now,
+      };
+      await db.collection('user_memberships').insertOne(um);
+
+      const payment = {
+        id: uuidv4(), user_id: newUser.id, amount: mem.price, currency: 'INR',
+        status: 'success', method: 'mock',
+        ref: 'MOCK_' + uuidv4().slice(0, 8).toUpperCase(),
+        membership_id: mem.id, user_membership_id: um.id, created_at: now,
+      };
+      await db.collection('payments').insertOne(payment);
+
+      // Auth cookie — user is now signed in
+      const token = createToken(newUser);
+      await setAuthCookie(token);
+
+      // Best-effort emails
+      try {
+        await sendMembershipPurchaseEmail({
+          to: newUser.email, name: newUser.full_name,
+          membershipName: mem.name, months: mem.duration_months, price: mem.price, expiryDate: expiry,
+        });
+      } catch (e) { /* non-fatal */ }
+
+      return j({
+        user: publicUser(newUser),
+        child_profile: childProfile ? clean(childProfile) : null,
+        user_membership: clean(um),
+        payment: clean(payment),
+      });
+    }
+
     // -------- CHECKOUT (MOCK PAYMENT) --------
-    if (route === '/checkout/mock' && method === 'POST') {
-      const auth = await requireUser(); if (auth.error) return auth.error;
+    if (route === '/checkout/mock' && method === 'POST') {      const auth = await requireUser(); if (auth.error) return auth.error;
       const { membership_id, child_profile_id, selected_sports } = await request.json();
       const mem = MEMBERSHIPS.find(m => m.id === membership_id);
       if (!mem) return err('Invalid membership');
@@ -637,19 +799,31 @@ async function handleRoute(request, { params }) {
       if (route === '/admin/members' && method === 'GET') {
         const url = new URL(request.url);
         const q = (url.searchParams.get('q') || '').toLowerCase().trim();
-        const users = await db.collection('users').find({}).sort({ created_at: -1 }).limit(500).toArray();
-        const filtered = q ? users.filter(u =>
-          (u.full_name || '').toLowerCase().includes(q) ||
-          (u.email || '').toLowerCase().includes(q) ||
-          (u.phone || '').includes(q)
-        ) : users;
-        const uids = filtered.map(u => u.id);
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+        const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '50')));
+        const skip = (page - 1) * limit;
+
+        const query = q ? {
+          $or: [
+            { full_name: { $regex: q, $options: 'i' } },
+            { email: { $regex: q, $options: 'i' } },
+            { phone: { $regex: q } },
+          ]
+        } : {};
+
+        const total = await db.collection('users').countDocuments(query);
+        const users = await db.collection('users').find(query).sort({ created_at: -1 }).skip(skip).limit(limit).toArray();
+
+        const uids = users.map(u => u.id);
         const ums = uids.length ? await db.collection('user_memberships').find({ user_id: { $in: uids } }).toArray() : [];
         const latestByUser = {};
         for (const m of ums) {
           if (!latestByUser[m.user_id] || new Date(m.created_at) > new Date(latestByUser[m.user_id].created_at)) latestByUser[m.user_id] = m;
         }
-        return j({ members: filtered.map(u => ({ ...publicUser(u), latest_membership: latestByUser[u.id] ? clean(latestByUser[u.id]) : null })) });
+        return j({
+          members: users.map(u => ({ ...publicUser(u), latest_membership: latestByUser[u.id] ? clean(latestByUser[u.id]) : null })),
+          total, page, limit,
+        });
       }
 
       const memPatch = route.match(/^\/admin\/members\/([^/]+)$/);
@@ -730,15 +904,127 @@ async function handleRoute(request, { params }) {
 
       // -------- Payments (admin) --------
       if (route === '/admin/payments' && method === 'GET') {
-        const payments = await db.collection('payments').find({}).sort({ created_at: -1 }).limit(500).toArray();
+        const url = new URL(request.url);
+        const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+        const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '50')));
+        const skip = (page - 1) * limit;
+        const total = await db.collection('payments').countDocuments({});
+        const payments = await db.collection('payments').find({}).sort({ created_at: -1 }).skip(skip).limit(limit).toArray();
         const uids = [...new Set(payments.map(p => p.user_id))];
         const users = uids.length ? await db.collection('users').find({ id: { $in: uids } }).toArray() : [];
         return j({
           payments: payments.map(p => {
             const u = users.find(x => x.id === p.user_id);
             return { ...clean(p), user_name: u?.full_name || 'Unknown', user_email: u?.email || '' };
-          })
+          }),
+          total, page, limit,
         });
+      }
+
+      // Refund a payment (marks refunded + expires linked membership)
+      const paymentRefundMatch = route.match(/^\/admin\/payments\/([^/]+)\/refund$/);
+      if (paymentRefundMatch && method === 'POST') {
+        const pid = paymentRefundMatch[1];
+        const p = await db.collection('payments').findOne({ id: pid });
+        if (!p) return err('Payment not found', 404);
+        if (p.status === 'refunded') return err('Already refunded', 400);
+        await db.collection('payments').updateOne({ id: pid }, {
+          $set: { status: 'refunded', refunded_at: new Date(), refunded_by: auth.user.id }
+        });
+        if (p.user_membership_id) {
+          await db.collection('user_memberships').updateOne({ id: p.user_membership_id }, {
+            $set: { status: 'expired', refunded_at: new Date() }
+          });
+        }
+        return j({ ok: true });
+      }
+
+      // Grant membership manually to a user
+      const grantMatch = route.match(/^\/admin\/members\/([^/]+)\/grant-membership$/);
+      if (grantMatch && method === 'POST') {
+        const uid = grantMatch[1];
+        const target = await db.collection('users').findOne({ id: uid });
+        if (!target) return err('User not found', 404);
+        const { membership_id, child_profile_id, selected_sports, note } = await request.json();
+        const mem = MEMBERSHIPS.find(m => m.id === membership_id);
+        if (!mem) return err('Invalid membership');
+        if (mem.category === 'kids' && !child_profile_id) return err('Child profile required for kids membership');
+
+        const now = new Date();
+        const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
+        const um = {
+          id: uuidv4(),
+          user_id: uid,
+          child_profile_id: child_profile_id || null,
+          membership_id: mem.id,
+          membership_snapshot: mem,
+          selected_sports: Array.isArray(selected_sports) ? selected_sports.slice(0, mem.max_sports || 99) : [],
+          start_date: now, expiry_date: expiry,
+          status: 'active', pause_days: 0, paused_at: null,
+          created_at: now, granted_by_admin: auth.user.id,
+          admin_note: note || '',
+        };
+        await db.collection('user_memberships').insertOne(um);
+        await db.collection('payments').insertOne({
+          id: uuidv4(), user_id: uid, amount: 0, currency: 'INR',
+          status: 'success', method: 'admin_granted',
+          ref: 'GRANT_' + uuidv4().slice(0, 8).toUpperCase(),
+          membership_id: mem.id, user_membership_id: um.id,
+          created_at: now, granted_by_admin: auth.user.id, admin_note: note || '',
+        });
+        return j({ user_membership: clean(um) });
+      }
+
+      // Extend a membership by N days
+      const extendMatch = route.match(/^\/admin\/memberships\/([^/]+)\/extend$/);
+      if (extendMatch && method === 'POST') {
+        const mid = extendMatch[1];
+        const { days, note } = await request.json();
+        const d = parseInt(days);
+        if (!d || d < 1 || d > 365) return err('days must be between 1 and 365');
+        const um = await db.collection('user_memberships').findOne({ id: mid });
+        if (!um) return err('Membership not found', 404);
+        const newExpiry = new Date(um.expiry_date);
+        newExpiry.setDate(newExpiry.getDate() + d);
+        const update = { expiry_date: newExpiry };
+        // If it was expired, reactivate
+        if (um.status === 'expired' && newExpiry > new Date()) update.status = 'active';
+        await db.collection('user_memberships').updateOne({ id: mid }, {
+          $set: update,
+          $push: { extensions: { days: d, at: new Date(), by: auth.user.id, note: note || '' } },
+        });
+        return j({ ok: true, expiry_date: newExpiry });
+      }
+
+      // Expire a membership immediately
+      const expireMatch = route.match(/^\/admin\/memberships\/([^/]+)\/expire$/);
+      if (expireMatch && method === 'POST') {
+        await db.collection('user_memberships').updateOne({ id: expireMatch[1] }, {
+          $set: { status: 'expired', expired_by_admin: auth.user.id, expired_at: new Date() }
+        });
+        return j({ ok: true });
+      }
+
+      // -------- Trial leads (admin) --------
+      if (route === '/admin/trial-leads' && method === 'GET') {
+        const list = await db.collection('trial_leads').find({}).sort({ created_at: -1 }).limit(500).toArray();
+        const classIds = [...new Set(list.map(l => l.class_id).filter(Boolean))];
+        const classes = classIds.length ? await db.collection('classes').find({ id: { $in: classIds } }).toArray() : [];
+        return j({
+          leads: list.map(l => {
+            const cls = l.class_id ? classes.find(c => c.id === l.class_id) : null;
+            const sport = SPORTS.find(s => s.id === l.sport_id);
+            return { ...clean(l), sport_name: sport?.name || l.sport_id, class: cls ? clean(cls) : null };
+          }),
+        });
+      }
+
+      const leadStatusMatch = route.match(/^\/admin\/trial-leads\/([^/]+)$/);
+      if (leadStatusMatch && method === 'PATCH') {
+        const { status } = await request.json();
+        if (!['pending', 'scheduled', 'attended', 'no_show', 'cancelled'].includes(status)) return err('Invalid status');
+        await db.collection('trial_leads').updateOne({ id: leadStatusMatch[1] }, { $set: { status, updated_at: new Date() } });
+        return j({ ok: true });
       }
 
       // -------- Coaches --------

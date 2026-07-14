@@ -23,7 +23,6 @@ function MembershipsInner() {
   const activeSports = SPORTS.filter(s => s.status === 'active');
 
   const choose = (plan) => {
-    if (!user) { router.push(`/auth?mode=register&next=/checkout?plan=${plan.id}`); return; }
     router.push(`/checkout?plan=${plan.id}`);
   };
 

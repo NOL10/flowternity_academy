@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { motion } from 'framer-motion';
-import { ArrowRight, Check, Zap, Users, Calendar, Trophy } from 'lucide-react';
+import { ArrowRight, Check, Zap, Users, Calendar, Trophy, Sparkles, CalendarCheck2 } from 'lucide-react';
 import { SPORTS, MEMBERSHIPS } from '@/lib/flowternity/config';
 
 const HERO_IMG = 'https://images.stockcake.com/public/1/b/f/1bfadcea-7ec1-49e5-94d3-ad24ada973ff_large/basketball-court-drama-stockcake.jpg';
@@ -45,9 +45,9 @@ function App() {
                     Get Membership <ArrowRight className="w-5 h-5 ml-2" />
                   </Button>
                 </Link>
-                <Link href="/classes">
+                <Link href="/trial">
                   <Button size="lg" variant="outline" className="h-14 px-8 text-base border-white/30 text-white hover:bg-white/10 hover:text-white bg-transparent">
-                    View Classes
+                    <Sparkles className="w-4 h-4 mr-2" /> Book a Free Class
                   </Button>
                 </Link>
               </div>
@@ -70,6 +70,33 @@ function App() {
         </div>
       </div>
 
+      {/* FREE TRIAL STRIP */}
+      <section className="relative -mt-16 md:-mt-20 z-20">
+        <div className="container">
+          <div className="rounded-3xl bg-accent p-6 md:p-10 shadow-2xl overflow-hidden relative">
+            <div className="absolute -right-8 -top-8 w-40 h-40 rounded-full bg-black/5" />
+            <div className="absolute -left-4 -bottom-8 w-32 h-32 rounded-full bg-black/5" />
+            <div className="relative flex flex-col md:flex-row md:items-center justify-between gap-6">
+              <div className="flex items-start gap-4">
+                <div className="w-14 h-14 rounded-2xl bg-black flex items-center justify-center flex-shrink-0">
+                  <CalendarCheck2 className="w-7 h-7 text-accent" />
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-widest text-black/60 font-semibold mb-1">First class on us</p>
+                  <h3 className="font-display font-black text-2xl md:text-3xl text-black leading-tight">Try any sport free. No card, no account needed.</h3>
+                  <p className="text-black/70 text-sm md:text-base mt-1">Pick a sport, pick a slot, show up. That&apos;s it.</p>
+                </div>
+              </div>
+              <Link href="/trial" className="flex-shrink-0">
+                <Button size="lg" className="bg-black text-white hover:bg-black/90 h-14 px-8 text-base font-semibold w-full md:w-auto">
+                  <Sparkles className="w-5 h-5 mr-2" /> Book a Free Class
+                </Button>
+              </Link>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* SPORTS GRID */}
       <section className="py-24 md:py-32">
         <div className="container">
@@ -82,13 +109,17 @@ function App() {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {SPORTS.map((sport, i) => (
-              <motion.div key={sport.id} initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} transition={{ delay: i * 0.05 }}>
+            {SPORTS.map((sport, i) => {
+              const isActive = sport.status === 'active';
+              const card = (
                 <div className="group relative aspect-[4/5] overflow-hidden rounded-2xl bg-secondary cursor-pointer">
                   <Image src={sport.image} alt={sport.name} fill className="object-cover transition-transform duration-700 group-hover:scale-110" sizes="400px" />
                   <div className="absolute inset-0 bg-gradient-to-t from-black via-black/40 to-transparent" />
                   {sport.status === 'coming_soon' && (
                     <Badge className="absolute top-4 right-4 bg-white/20 text-white backdrop-blur-md border-white/20">Coming Soon</Badge>
+                  )}
+                  {isActive && (
+                    <Badge className="absolute top-4 right-4 bg-accent text-black hover:bg-accent"><Sparkles className="w-3 h-3 mr-1" /> Free trial</Badge>
                   )}
                   <div className="absolute bottom-6 left-6 right-6 text-white">
                     <h3 className="font-display font-black text-3xl mb-1">{sport.name}</h3>
@@ -96,8 +127,15 @@ function App() {
                     <p className="text-sm text-white/60 line-clamp-2">{sport.description}</p>
                   </div>
                 </div>
-              </motion.div>
-            ))}
+              );
+              return (
+                <motion.div key={sport.id} initial={{ opacity: 0, y: 20 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }} transition={{ delay: i * 0.05 }}>
+                  {isActive ? (
+                    <Link href={`/trial?sport=${sport.id}`} aria-label={`Book free ${sport.name} class`}>{card}</Link>
+                  ) : card}
+                </motion.div>
+              );
+            })}
           </div>
         </div>
       </section>
@@ -173,10 +211,10 @@ function App() {
           <Card className="p-12 md:p-20 bg-accent border-0 rounded-3xl relative overflow-hidden">
             <div className="relative z-10 max-w-2xl">
               <h2 className="font-display font-black text-5xl md:text-7xl leading-[0.95] text-black">Ready to move?</h2>
-              <p className="text-black/70 text-lg mt-4">Join Flowternity today. Your first class is 60 seconds away.</p>
+              <p className="text-black/70 text-lg mt-4">Two paths in. Try a free class or grab a membership — either way, first booking is 60 seconds away.</p>
               <div className="mt-8 flex flex-col sm:flex-row gap-3">
-                <Link href="/auth?mode=register"><Button size="lg" className="bg-black text-white hover:bg-black/90 h-14 px-8">Create Account <ArrowRight className="w-5 h-5 ml-2" /></Button></Link>
-                <Link href="/memberships"><Button size="lg" variant="outline" className="h-14 px-8 border-black/20 bg-transparent text-black hover:bg-black/10">View Plans</Button></Link>
+                <Link href="/memberships"><Button size="lg" className="bg-black text-white hover:bg-black/90 h-14 px-8">Get Membership <ArrowRight className="w-5 h-5 ml-2" /></Button></Link>
+                <Link href="/trial"><Button size="lg" variant="outline" className="h-14 px-8 border-black/20 bg-transparent text-black hover:bg-black/10"><Sparkles className="w-4 h-4 mr-2" /> Book Free Class</Button></Link>
               </div>
             </div>
           </Card>

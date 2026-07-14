@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/app/providers';
-import { Menu, X, Zap } from 'lucide-react';
+import { Menu, X, Zap, Sparkles } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 
@@ -12,15 +12,26 @@ export default function SiteNav({ dark = false }) {
   const { user, logout } = useAuth();
   const [open, setOpen] = useState(false);
 
-  const links = [
-    { href: '/', label: 'Home' },
+  // Base links visible to everyone (Home removed — logo is home).
+  const baseLinks = [
     { href: '/memberships', label: 'Memberships' },
-    { href: '/games', label: 'Games' },
-    { href: '/classes', label: 'Classes' },
     { href: '/coaches', label: 'Coaches' },
     { href: '/about', label: 'About' },
     { href: '/contact', label: 'Contact' },
   ];
+
+  // Links only visible after login.
+  const authedLinks = [];
+  if (user) {
+    // Classes: adults, parents, kids, admin all book classes
+    authedLinks.push({ href: '/classes', label: 'Classes' });
+    // Games: adults only (kids memberships can't book games — per business rules)
+    if (user.role === 'adult' || user.role === 'admin') {
+      authedLinks.push({ href: '/games', label: 'Games' });
+    }
+  }
+
+  const links = [...baseLinks, ...authedLinks];
 
   const textColor = dark ? 'text-white' : 'text-foreground';
   const border = dark ? 'border-white/10' : 'border-black/10';
@@ -28,7 +39,7 @@ export default function SiteNav({ dark = false }) {
   return (
     <header className={`w-full ${dark ? 'bg-transparent' : 'bg-background/80 backdrop-blur-lg'} border-b ${border} sticky top-0 z-40`}>
       <div className="container flex items-center justify-between h-16">
-        <Link href="/" className={`flex items-center gap-2 ${textColor}`}>
+        <Link href="/" className={`flex items-center gap-2 ${textColor}`} aria-label="Flowternity home">
           <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center">
             <Zap className="w-5 h-5 text-black" strokeWidth={2.5} />
           </div>
@@ -60,6 +71,9 @@ export default function SiteNav({ dark = false }) {
                 <DropdownMenuItem asChild><Link href="/dashboard">Dashboard</Link></DropdownMenuItem>
                 <DropdownMenuItem asChild><Link href="/profile">Profile</Link></DropdownMenuItem>
                 <DropdownMenuItem asChild><Link href="/classes">Book Class</Link></DropdownMenuItem>
+                {(user.role === 'adult' || user.role === 'admin') && (
+                  <DropdownMenuItem asChild><Link href="/games">Games</Link></DropdownMenuItem>
+                )}
                 {user.role === 'admin' && <DropdownMenuItem asChild><Link href="/admin">Admin Panel</Link></DropdownMenuItem>}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={logout} className="text-destructive">Sign out</DropdownMenuItem>
@@ -67,8 +81,13 @@ export default function SiteNav({ dark = false }) {
             </DropdownMenu>
           ) : (
             <>
-              <Link href="/auth?mode=login"><Button variant={dark ? 'ghost' : 'ghost'} className={dark ? 'text-white hover:bg-white/10 hover:text-white' : ''}>Sign in</Button></Link>
-              <Link href="/auth?mode=register"><Button className="bg-accent text-black hover:bg-accent/90">Join Now</Button></Link>
+              <Link href="/trial">
+                <Button variant="ghost" className={dark ? 'text-white hover:bg-white/10 hover:text-white' : ''}>
+                  <Sparkles className="w-4 h-4 mr-1.5" /> Free class
+                </Button>
+              </Link>
+              <Link href="/auth?mode=login"><Button variant="ghost" className={dark ? 'text-white hover:bg-white/10 hover:text-white' : ''}>Sign in</Button></Link>
+              <Link href="/memberships"><Button className="bg-accent text-black hover:bg-accent/90">Join Now</Button></Link>
             </>
           )}
         </div>
@@ -86,14 +105,18 @@ export default function SiteNav({ dark = false }) {
             ))}
             {user ? (
               <>
-                <Link href="/dashboard" className={`text-sm font-medium ${textColor} py-2`}>Dashboard</Link>
-                {user.role === 'admin' && <Link href="/admin" className={`text-sm font-medium ${textColor} py-2`}>Admin</Link>}
+                <Link href="/dashboard" className={`text-sm font-medium ${textColor} py-2`} onClick={() => setOpen(false)}>Dashboard</Link>
+                <Link href="/profile" className={`text-sm font-medium ${textColor} py-2`} onClick={() => setOpen(false)}>Profile</Link>
+                {user.role === 'admin' && <Link href="/admin" className={`text-sm font-medium ${textColor} py-2`} onClick={() => setOpen(false)}>Admin</Link>}
                 <button onClick={logout} className="text-sm text-destructive text-left py-2">Sign out</button>
               </>
             ) : (
-              <div className="flex gap-2 pt-2">
-                <Link className="flex-1" href="/auth?mode=login"><Button variant="outline" className="w-full">Sign in</Button></Link>
-                <Link className="flex-1" href="/auth?mode=register"><Button className="w-full bg-accent text-black hover:bg-accent/90">Join Now</Button></Link>
+              <div className="flex flex-col gap-2 pt-2">
+                <Link href="/trial" onClick={() => setOpen(false)}><Button variant="outline" className="w-full"><Sparkles className="w-4 h-4 mr-1.5" /> Book free class</Button></Link>
+                <div className="flex gap-2">
+                  <Link className="flex-1" href="/auth?mode=login" onClick={() => setOpen(false)}><Button variant="outline" className="w-full">Sign in</Button></Link>
+                  <Link className="flex-1" href="/memberships" onClick={() => setOpen(false)}><Button className="w-full bg-accent text-black hover:bg-accent/90">Join Now</Button></Link>
+                </div>
               </div>
             )}
           </div>
