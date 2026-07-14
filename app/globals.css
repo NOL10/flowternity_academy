@@ -81,3 +81,24 @@
     mix-blend-mode: overlay;
   }
 }
+
+/* Admin console scoped overrides — makes form controls fit dark theme */
+.admin-scope input,
+.admin-scope textarea,
+.admin-scope [data-slot="select-trigger"],
+.admin-scope button[role="combobox"] {
+  background-color: rgb(2 6 23) !important;
+  border-color: rgb(51 65 85) !important;
+  color: rgb(241 245 249) !important;
+}
+.admin-scope input::placeholder,
+.admin-scope textarea::placeholder {
+  color: rgb(100 116 139) !important;
+}
+.admin-scope input:focus,
+.admin-scope textarea:focus,
+.admin-scope [data-slot="select-trigger"]:focus {
+  border-color: rgb(163 230 53) !important;
+  outline: none !important;
+  box-shadow: 0 0 0 2px rgba(163, 230, 53, 0.2) !important;
+}
