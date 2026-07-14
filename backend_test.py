@@ -11,7 +11,7 @@ import sys
 import os
 
 # Load environment variables
-BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'https://schedule-manager-152.preview.emergentagent.com')
+BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'https://run-workflow.preview.emergentagent.com')
 API_BASE = f"{BASE_URL}/api"
 ADMIN_EMAIL = "admin@flowternity.com"
 ADMIN_PASSWORD = "admin123"
