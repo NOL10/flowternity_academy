@@ -1,5 +1,12 @@
 const nextConfig = {
   output: 'standalone',
+  allowedDevOrigins: [
+    'run-workflow.cluster-7.preview.emergentcf.cloud',
+    '*.emergentagent.com',
+    '*.emergentcf.cloud',
+    '**.emergentagent.com',
+    '**.emergentcf.cloud',
+  ],
   images: {
     unoptimized: true,
     remotePatterns: [
