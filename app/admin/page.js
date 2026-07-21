@@ -26,6 +26,7 @@ const NAV = [
   { id: 'classes', label: 'Classes', icon: ClipboardList },
   { id: 'games', label: 'Games', icon: Flame },
   { id: 'members', label: 'Members', icon: Users },
+  { id: 'performance', label: 'Performance', icon: TrendingUp },
   { id: 'trials', label: 'Free Trials', icon: Sparkles },
   { id: 'attendance', label: 'Attendance', icon: CheckCircle2 },
   { id: 'payments', label: 'Payments', icon: CreditCard },
@@ -142,6 +143,7 @@ export default function AdminPage() {
             {tab === 'classes' && <ClassesSection />}
             {tab === 'games' && <GamesSection />}
             {tab === 'members' && <MembersSection />}
+            {tab === 'performance' && <PerformanceSection />}
             {tab === 'trials' && <TrialsSection />}
             {tab === 'attendance' && <AttendanceSection />}
             {tab === 'payments' && <PaymentsSection />}
@@ -289,10 +291,25 @@ function ClassesSection() {
   const [form, setForm] = useState(emptyForm);
   const [saving, setSaving] = useState(false);
   const [filter, setFilter] = useState('all');
+  const [selectedIds, setSelectedIds] = useState([]);
+
+  // Bulk / Recurring mode state
+  const [mode, setMode] = useState('single'); // 'single' | 'recurring'
+  const emptyBulk = {
+    sport_id: 'basketball',
+    coach_name: '',
+    capacity: 12,
+    start_date: '',
+    end_date: '',
+    weekdays: [1, 3, 5], // Mon Wed Fri default
+    slots: [{ start_time: '17:00', end_time: '18:00' }],
+  };
+  const [bulk, setBulk] = useState(emptyBulk);
 
   const load = async () => {
     const c = await fetch('/api/admin/classes', { credentials: 'include' }).then(r => r.json());
     setClasses(c.classes || []);
+    setSelectedIds([]);
   };
   useEffect(() => { load(); }, []);
 
@@ -309,12 +326,31 @@ function ClassesSection() {
     toast.success('Class scheduled');
     load();
     if (keepOpen) {
-      // keep sport/coach/capacity, reset date+times to make next entry fast
       setForm(f => ({ ...f, date: '', start_time: '', end_time: '' }));
     } else {
       setForm(emptyForm);
       setOpen(false);
     }
+  };
+
+  const bulkCreate = async (e) => {
+    e.preventDefault();
+    if (!bulk.start_date || !bulk.end_date) { toast.error('Pick a date range'); return; }
+    if (bulk.weekdays.length === 0) { toast.error('Pick at least one weekday'); return; }
+    if (!bulk.slots.length || bulk.slots.some(s => !s.start_time || !s.end_time)) { toast.error('Fill all time slots'); return; }
+    setSaving(true);
+    const res = await fetch('/api/admin/classes/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify(bulk),
+    });
+    const d = await res.json();
+    setSaving(false);
+    if (!res.ok) { toast.error(d.error || 'Bulk schedule failed'); return; }
+    toast.success(`Created ${d.count} classes`);
+    load();
+    setBulk(emptyBulk);
+    setOpen(false);
+    setMode('single');
   };
 
   const remove = async (id) => {
@@ -323,20 +359,66 @@ function ClassesSection() {
     if (res.ok) { toast.success('Deleted'); load(); }
   };
 
+  const bulkDelete = async () => {
+    if (selectedIds.length === 0) return;
+    if (!confirm(`Delete ${selectedIds.length} class(es)? All bookings will be cancelled.`)) return;
+    const res = await fetch('/api/admin/classes/bulk-delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ ids: selectedIds }),
+    });
+    const d = await res.json();
+    if (!res.ok) { toast.error(d.error || 'Failed'); return; }
+    toast.success(`Deleted ${d.deleted} classes`);
+    load();
+  };
+
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
   const filtered = useMemo(() => {
     if (filter === 'all') return classes;
     return classes.filter(c => c.sport_id === filter);
   }, [classes, filter]);
 
+  const toggleWeekday = (d) => {
+    setBulk(b => ({ ...b, weekdays: b.weekdays.includes(d) ? b.weekdays.filter(x => x !== d) : [...b.weekdays, d].sort() }));
+  };
+  const addSlot = () => setBulk(b => ({ ...b, slots: [...b.slots, { start_time: '', end_time: '' }] }));
+  const removeSlot = (i) => setBulk(b => ({ ...b, slots: b.slots.filter((_, idx) => idx !== i) }));
+  const updateSlot = (i, k, v) => setBulk(b => ({ ...b, slots: b.slots.map((s, idx) => idx === i ? { ...s, [k]: v } : s) }));
+
+  // Estimate count preview
+  const bulkPreview = useMemo(() => {
+    if (!bulk.start_date || !bulk.end_date) return 0;
+    const s = new Date(bulk.start_date), e = new Date(bulk.end_date);
+    if (isNaN(s) || isNaN(e) || s > e) return 0;
+    const wk = new Set(bulk.weekdays);
+    let count = 0;
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+      if (wk.has(d.getDay())) count += bulk.slots.length;
+    }
+    return count;
+  }, [bulk]);
+
+  const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
   return (
     <>
       <SectionHeader
         title="Classes"
-        description={`${classes.length} scheduled · manage the class roster.`}
+        description={`${classes.length} scheduled · single or recurring.`}
         action={
-          <Button onClick={() => setOpen(true)} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
-            <Plus className="w-4 h-4 mr-1.5" /> Schedule Class
-          </Button>
+          <div className="flex items-center gap-2">
+            {selectedIds.length > 0 && (
+              <Button onClick={bulkDelete} variant="outline" className="border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20">
+                <Trash2 className="w-4 h-4 mr-1.5" /> Delete {selectedIds.length}
+              </Button>
+            )}
+            <Button onClick={() => setOpen(true)} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
+              <Plus className="w-4 h-4 mr-1.5" /> Schedule Class
+            </Button>
+          </div>
         }
       />
 
@@ -353,25 +435,28 @@ function ClassesSection() {
       ) : (
         <Card className="rounded-lg bg-slate-900 border-slate-800 overflow-hidden">
           <div className="hidden md:grid grid-cols-12 gap-3 px-4 py-2.5 text-[10px] uppercase tracking-widest text-slate-500 border-b border-slate-800">
+            <div className="col-span-1"><Checkbox checked={filtered.length > 0 && selectedIds.length === filtered.length} onCheckedChange={(v) => setSelectedIds(v ? filtered.map(c => c.id) : [])} /></div>
             <div className="col-span-1">Date</div>
             <div className="col-span-3">Sport</div>
-            <div className="col-span-3">Coach</div>
+            <div className="col-span-2">Coach</div>
             <div className="col-span-2">Time</div>
             <div className="col-span-2">Capacity</div>
             <div className="col-span-1 text-right">Actions</div>
           </div>
           {filtered.map(c => {
             const sport = SPORTS.find(s => s.id === c.sport_id);
+            const sel = selectedIds.includes(c.id);
             return (
-              <div key={c.id} className="grid grid-cols-12 gap-3 px-4 py-3 items-center border-b border-slate-800 last:border-0 hover:bg-slate-800/40 transition-colors">
-                <div className="col-span-4 md:col-span-1 flex items-center gap-2">
+              <div key={c.id} className={`grid grid-cols-12 gap-3 px-4 py-3 items-center border-b border-slate-800 last:border-0 hover:bg-slate-800/40 transition-colors ${sel ? 'bg-lime-400/5' : ''}`}>
+                <div className="col-span-1"><Checkbox checked={sel} onCheckedChange={() => toggleSelect(c.id)} /></div>
+                <div className="col-span-3 md:col-span-1 flex items-center gap-2">
                   <div className="w-10 h-10 rounded bg-slate-800 flex flex-col items-center justify-center leading-none">
                     <span className="text-[9px] uppercase text-slate-500">{new Date(c.date).toLocaleDateString('en-IN', { month: 'short' })}</span>
                     <span className="text-sm font-bold text-slate-100">{new Date(c.date).getDate()}</span>
                   </div>
                 </div>
-                <div className="col-span-8 md:col-span-3 font-medium text-slate-100">{sport?.name}</div>
-                <div className="col-span-6 md:col-span-3 text-sm text-slate-300">{c.coach_name}</div>
+                <div className="col-span-7 md:col-span-3 font-medium text-slate-100">{sport?.name}{c.batch_tag && <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-lime-400/10 text-lime-400 uppercase tracking-widest">bulk</span>}</div>
+                <div className="col-span-6 md:col-span-2 text-sm text-slate-300">{c.coach_name}</div>
                 <div className="col-span-6 md:col-span-2 font-mono text-sm text-slate-300">{c.start_time}–{c.end_time}</div>
                 <div className="col-span-6 md:col-span-2 text-sm text-slate-300">{c.capacity} slots</div>
                 <div className="col-span-6 md:col-span-1 flex justify-end">
@@ -386,51 +471,137 @@ function ClassesSection() {
       )}
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg bg-slate-900 border-slate-800 text-slate-100">
+        <DialogContent className="max-w-2xl bg-slate-900 border-slate-800 text-slate-100">
           <DialogHeader>
-            <DialogTitle className="text-slate-50">Schedule a class</DialogTitle>
-            <DialogDescription className="text-slate-400">Fill the details — click &ldquo;Save &amp; add another&rdquo; to keep the dialog open.</DialogDescription>
+            <DialogTitle className="text-slate-50">Schedule classes</DialogTitle>
+            <DialogDescription className="text-slate-400">Create one class, or a whole recurring batch in one go.</DialogDescription>
           </DialogHeader>
-          <form onSubmit={(e) => create(e, false)} className="space-y-3">
-            <div>
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Sport</Label>
-              <Select value={form.sport_id} onValueChange={v => setForm({ ...form, sport_id: v })}>
-                <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
-                <SelectContent>{SPORTS.filter(s => s.status === 'active').map(s => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
-            <div>
-              <Label className="text-slate-300 text-xs uppercase tracking-widest">Coach name</Label>
-              <Input required className="h-11 mt-1" value={form.coach_name} onChange={e => setForm({ ...form, coach_name: e.target.value })} placeholder="Coach Ravi" />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
+
+          {/* Mode toggle */}
+          <div className="flex items-center gap-2 mb-2 p-1 bg-slate-800 rounded-lg w-fit">
+            <button type="button" onClick={() => setMode('single')} className={`px-4 py-1.5 rounded-md text-sm font-medium transition ${mode === 'single' ? 'bg-slate-100 text-slate-900' : 'text-slate-400 hover:text-slate-100'}`}>
+              Single class
+            </button>
+            <button type="button" onClick={() => setMode('recurring')} className={`px-4 py-1.5 rounded-md text-sm font-medium transition ${mode === 'recurring' ? 'bg-lime-400 text-slate-900' : 'text-slate-400 hover:text-slate-100'}`}>
+              <CalendarPlus className="w-3.5 h-3.5 inline mr-1" /> Recurring batch
+            </button>
+          </div>
+
+          {mode === 'single' ? (
+            <form onSubmit={(e) => create(e, false)} className="space-y-3">
               <div>
-                <Label className="text-slate-300 text-xs uppercase tracking-widest">Date</Label>
-                <Input type="date" required className="h-11 mt-1" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} />
+                <Label className="text-slate-300 text-xs uppercase tracking-widest">Sport</Label>
+                <Select value={form.sport_id} onValueChange={v => setForm({ ...form, sport_id: v })}>
+                  <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+                  <SelectContent>{SPORTS.filter(s => s.status === 'active').map(s => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}</SelectContent>
+                </Select>
               </div>
               <div>
-                <Label className="text-slate-300 text-xs uppercase tracking-widest">Capacity</Label>
-                <Input type="number" min="1" required className="h-11 mt-1" value={form.capacity} onChange={e => setForm({ ...form, capacity: e.target.value })} />
+                <Label className="text-slate-300 text-xs uppercase tracking-widest">Coach name</Label>
+                <Input required className="h-11 mt-1" value={form.coach_name} onChange={e => setForm({ ...form, coach_name: e.target.value })} placeholder="Coach Ravi" />
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Date</Label>
+                  <Input type="date" required className="h-11 mt-1" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} />
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Capacity</Label>
+                  <Input type="number" min="1" required className="h-11 mt-1" value={form.capacity} onChange={e => setForm({ ...form, capacity: e.target.value })} />
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Start</Label>
+                  <Input type="time" required className="h-11 mt-1" value={form.start_time} onChange={e => setForm({ ...form, start_time: e.target.value })} />
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">End</Label>
+                  <Input type="time" required className="h-11 mt-1" value={form.end_time} onChange={e => setForm({ ...form, end_time: e.target.value })} />
+                </div>
+              </div>
+              <DialogFooter className="pt-3 flex-col-reverse sm:flex-row gap-2">
+                <Button type="button" variant="outline" onClick={() => setOpen(false)} className="border-slate-700 bg-transparent hover:bg-slate-800 text-slate-300">Cancel</Button>
+                <Button type="button" disabled={saving} onClick={(e) => create(e, true)} variant="outline" className="border-slate-700 bg-transparent hover:bg-slate-800 text-slate-100">
+                  {saving ? '...' : 'Save & add another'}
+                </Button>
+                <Button type="submit" disabled={saving} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
+                  <Plus className="w-4 h-4 mr-1.5" /> {saving ? 'Saving…' : 'Schedule'}
+                </Button>
+              </DialogFooter>
+            </form>
+          ) : (
+            <form onSubmit={bulkCreate} className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Sport</Label>
+                  <Select value={bulk.sport_id} onValueChange={v => setBulk({ ...bulk, sport_id: v })}>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
+                    <SelectContent>{SPORTS.filter(s => s.status === 'active').map(s => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Capacity</Label>
+                  <Input type="number" min="1" required className="h-11 mt-1" value={bulk.capacity} onChange={e => setBulk({ ...bulk, capacity: e.target.value })} />
+                </div>
+                <div className="col-span-2">
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Coach name</Label>
+                  <Input required className="h-11 mt-1" value={bulk.coach_name} onChange={e => setBulk({ ...bulk, coach_name: e.target.value })} placeholder="Coach Ravi" />
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Start date</Label>
+                  <Input type="date" required className="h-11 mt-1" value={bulk.start_date} onChange={e => setBulk({ ...bulk, start_date: e.target.value })} />
+                </div>
+                <div>
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">End date</Label>
+                  <Input type="date" required className="h-11 mt-1" value={bulk.end_date} onChange={e => setBulk({ ...bulk, end_date: e.target.value })} />
+                </div>
+              </div>
+
               <div>
-                <Label className="text-slate-300 text-xs uppercase tracking-widest">Start</Label>
-                <Input type="time" required className="h-11 mt-1" value={form.start_time} onChange={e => setForm({ ...form, start_time: e.target.value })} />
+                <Label className="text-slate-300 text-xs uppercase tracking-widest">Repeat on</Label>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {WEEKDAY_LABELS.map((lbl, i) => {
+                    const on = bulk.weekdays.includes(i);
+                    return (
+                      <button key={i} type="button" onClick={() => toggleWeekday(i)} className={`w-12 h-10 rounded-md border text-xs font-semibold transition ${on ? 'bg-lime-400 text-slate-900 border-lime-400' : 'border-slate-700 text-slate-400 hover:text-slate-100'}`}>
+                        {lbl}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
+
               <div>
-                <Label className="text-slate-300 text-xs uppercase tracking-widest">End</Label>
-                <Input type="time" required className="h-11 mt-1" value={form.end_time} onChange={e => setForm({ ...form, end_time: e.target.value })} />
+                <div className="flex items-center justify-between mb-2">
+                  <Label className="text-slate-300 text-xs uppercase tracking-widest">Time slots (per day)</Label>
+                  <button type="button" onClick={addSlot} className="text-xs text-lime-400 hover:text-lime-300 flex items-center gap-1"><Plus className="w-3 h-3" /> Add slot</button>
+                </div>
+                <div className="space-y-2">
+                  {bulk.slots.map((s, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input type="time" className="h-10 flex-1" value={s.start_time} onChange={e => updateSlot(i, 'start_time', e.target.value)} />
+                      <span className="text-slate-500 text-xs">to</span>
+                      <Input type="time" className="h-10 flex-1" value={s.end_time} onChange={e => updateSlot(i, 'end_time', e.target.value)} />
+                      {bulk.slots.length > 1 && (
+                        <button type="button" onClick={() => removeSlot(i)} className="p-2 rounded hover:bg-red-500/10 text-slate-500 hover:text-red-400"><XCircle className="w-4 h-4" /></button>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
-            <DialogFooter className="pt-3 flex-col-reverse sm:flex-row gap-2">
-              <Button type="button" variant="outline" onClick={() => setOpen(false)} className="border-slate-700 bg-transparent hover:bg-slate-800 text-slate-300">Cancel</Button>
-              <Button type="button" disabled={saving} onClick={(e) => create(e, true)} variant="outline" className="border-slate-700 bg-transparent hover:bg-slate-800 text-slate-100">
-                {saving ? '...' : 'Save & add another'}
-              </Button>
-              <Button type="submit" disabled={saving} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
-                <Plus className="w-4 h-4 mr-1.5" /> {saving ? 'Saving…' : 'Schedule'}
-              </Button>
-            </DialogFooter>
-          </form>
+
+              <div className="rounded-lg bg-slate-800/50 border border-slate-800 p-3 text-sm flex items-center justify-between">
+                <span className="text-slate-400">Preview</span>
+                <span className="text-slate-100 font-mono font-semibold">{bulkPreview} class{bulkPreview === 1 ? '' : 'es'} will be created</span>
+              </div>
+
+              <DialogFooter className="pt-3 flex-col-reverse sm:flex-row gap-2">
+                <Button type="button" variant="outline" onClick={() => setOpen(false)} className="border-slate-700 bg-transparent hover:bg-slate-800 text-slate-300">Cancel</Button>
+                <Button type="submit" disabled={saving || bulkPreview === 0} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
+                  <CalendarPlus className="w-4 h-4 mr-1.5" /> {saving ? 'Creating…' : `Create ${bulkPreview} classes`}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
         </DialogContent>
       </Dialog>
     </>
@@ -1443,5 +1614,236 @@ function EmptyState({ icon: Icon, title, cta, onClick }) {
         </Button>
       )}
     </Card>
+  );
+}
+
+
+// ===================== PERFORMANCE (metrics + kids levels) =====================
+function PerformanceSection() {
+  const [q, setQ] = useState('');
+  const [members, setMembers] = useState([]);
+  const [subjects, setSubjects] = useState([]); // list of {id, label, type, sports:[]}
+  const [selected, setSelected] = useState(null); // {id, label, type}
+  const [data, setData] = useState(null); // {subject, sports:[], levels_catalog:[]}
+  const [loading, setLoading] = useState(false);
+  const [activeSport, setActiveSport] = useState(null);
+  const [dirty, setDirty] = useState({}); // { [metric_key]: number }
+  const [saving, setSaving] = useState(false);
+
+  // Search members
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      const r = await fetch(`/api/admin/members?q=${encodeURIComponent(q)}&limit=20`, { credentials: 'include' });
+      const d = await r.json();
+      setMembers(d.members || []);
+    }, 250);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  // Build subject list (user + their child_profiles)
+  const openMember = async (m) => {
+    setLoading(true);
+    // Fetch member detail to get children
+    const dr = await fetch(`/api/admin/members/${m.id}/detail`, { credentials: 'include' });
+    const dd = await dr.json();
+    const children = dd.children || [];
+    const subs = [{ id: m.id, label: `${m.full_name} · ${m.role}`, type: 'user' }];
+    for (const c of children) {
+      subs.push({ id: c.id, label: `${c.child_name} (child of ${m.full_name})`, type: 'child' });
+    }
+    setSubjects(subs);
+    // Auto-select first
+    await pickSubject(subs[0]);
+    setLoading(false);
+  };
+
+  const pickSubject = async (s) => {
+    if (!s) return;
+    setSelected(s);
+    setDirty({});
+    const r = await fetch(`/api/admin/athletes/${s.id}/performance`, { credentials: 'include' });
+    const d = await r.json();
+    setData(d);
+    setActiveSport(d.sports?.[0]?.sport_id || null);
+  };
+
+  const currentSportData = data?.sports?.find(s => s.sport_id === activeSport);
+
+  const scoreValue = (mkey) => {
+    if (dirty[mkey] !== undefined) return dirty[mkey];
+    return currentSportData?.scores?.[mkey] ?? '';
+  };
+
+  const setScore = (mkey, v) => {
+    if (v === '' || v === null) { setDirty(d => { const nd = { ...d }; delete nd[mkey]; return nd; }); return; }
+    const num = Math.max(0, Math.min(10, Number(v)));
+    setDirty(d => ({ ...d, [mkey]: num }));
+  };
+
+  const saveScores = async () => {
+    if (!selected || !activeSport) return;
+    if (Object.keys(dirty).length === 0) { toast.info('No changes'); return; }
+    setSaving(true);
+    const r = await fetch(`/api/admin/athletes/${selected.id}/metrics`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ sport_id: activeSport, scores: dirty }),
+    });
+    const d = await r.json();
+    setSaving(false);
+    if (!r.ok) { toast.error(d.error || 'Save failed'); return; }
+    toast.success('Scores saved');
+    setDirty({});
+    await pickSubject(selected);
+  };
+
+  const setLevel = async (lvl) => {
+    if (!selected || selected.type !== 'child' || !activeSport) return;
+    const r = await fetch(`/api/admin/athletes/${selected.id}/level`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+      body: JSON.stringify({ sport_id: activeSport, level: Number(lvl) }),
+    });
+    const d = await r.json();
+    if (!r.ok) { toast.error(d.error || 'Failed'); return; }
+    toast.success(`Level set → ${d.level_info?.name}`);
+    await pickSubject(selected);
+  };
+
+  return (
+    <>
+      <SectionHeader
+        title="Performance"
+        description="Score athletes 0–10 per metric. Assign kids a progression level (SPARK → LEGACY)."
+      />
+
+      <div className="grid md:grid-cols-[320px_1fr] gap-6">
+        {/* Left: member search */}
+        <Card className="rounded-lg bg-slate-900 border-slate-800 p-3 h-fit sticky top-16">
+          <div className="relative mb-3">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+            <Input value={q} onChange={e => setQ(e.target.value)} className="h-10 pl-9 bg-slate-950 border-slate-800" placeholder="Search by name / email / phone" />
+          </div>
+          <div className="space-y-1 max-h-[500px] overflow-y-auto">
+            {members.length === 0 ? (
+              <p className="text-xs text-slate-500 px-3 py-4">No members found</p>
+            ) : members.map(m => (
+              <button key={m.id} onClick={() => openMember(m)} className={`w-full text-left px-3 py-2.5 rounded-md text-sm transition ${subjects.some(s => s.id === m.id && s.type === 'user') ? 'bg-lime-400/10 text-lime-300' : 'hover:bg-slate-800 text-slate-300'}`}>
+                <div className="font-medium truncate">{m.full_name}</div>
+                <div className="text-[11px] text-slate-500 truncate">{m.email} · {m.role}</div>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* Right: metrics editor */}
+        <div>
+          {loading && <p className="text-slate-500">Loading…</p>}
+          {!loading && !selected && (
+            <EmptyState icon={TrendingUp} title="Pick a member to view / edit performance" />
+          )}
+          {!loading && selected && data && (
+            <div className="space-y-4">
+              {/* Subject switcher (user + kids) */}
+              {subjects.length > 1 && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-slate-500 uppercase tracking-widest mr-1">Athlete</span>
+                  {subjects.map(s => (
+                    <button key={s.id} onClick={() => pickSubject(s)} className={`text-xs px-3 py-1.5 rounded-full border transition ${selected.id === s.id ? 'bg-lime-400 text-slate-900 border-lime-400 font-semibold' : 'border-slate-700 text-slate-400 hover:text-slate-100'}`}>
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Sport tabs */}
+              {data.sports.length === 0 ? (
+                <Card className="rounded-lg bg-slate-900 border-slate-800 p-8 text-center">
+                  <p className="text-slate-400">No sports enrolled yet.</p>
+                  <p className="text-xs text-slate-500 mt-1">Grant them a membership first (Members tab).</p>
+                </Card>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2 border-b border-slate-800">
+                    {data.sports.map(sp => (
+                      <button key={sp.sport_id} onClick={() => { setActiveSport(sp.sport_id); setDirty({}); }} className={`px-4 py-2.5 text-sm font-medium border-b-2 transition ${activeSport === sp.sport_id ? 'border-lime-400 text-lime-400' : 'border-transparent text-slate-400 hover:text-slate-100'}`}>
+                        {sp.sport_name}
+                      </button>
+                    ))}
+                  </div>
+
+                  {currentSportData && (
+                    <>
+                      {/* Kids level card */}
+                      {selected.type === 'child' && (
+                        <Card className="rounded-lg bg-gradient-to-br from-lime-400/10 to-transparent border-lime-400/20 p-5">
+                          <div className="flex flex-col md:flex-row md:items-center gap-4 justify-between">
+                            <div>
+                              <p className="text-xs uppercase tracking-widest text-lime-400 mb-1">Progression level</p>
+                              <div className="flex items-baseline gap-3">
+                                <span className="font-display font-black text-3xl text-slate-100">L{currentSportData.level || 1}</span>
+                                <span className="font-semibold text-lg text-slate-100">{(currentSportData.level_info?.name) || 'SPARK'}</span>
+                              </div>
+                              <p className="text-xs text-slate-400 italic mt-1">&ldquo;{(currentSportData.level_info?.quote) || 'Every champion starts with a spark.'}&rdquo;</p>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {(data.levels_catalog || []).map(l => {
+                                const active = (currentSportData.level || 1) === l.level;
+                                return (
+                                  <button key={l.level} onClick={() => setLevel(l.level)} className={`px-2.5 py-1.5 rounded-md text-xs font-semibold transition ${active ? 'bg-lime-400 text-slate-900' : 'bg-slate-800 text-slate-400 hover:text-slate-100 border border-slate-700'}`} title={l.quote}>
+                                    L{l.level} {l.name}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </Card>
+                      )}
+
+                      {/* Metric inputs */}
+                      <Card className="rounded-lg bg-slate-900 border-slate-800 p-5">
+                        <div className="flex items-center justify-between mb-4">
+                          <div>
+                            <h3 className="font-semibold text-slate-100">{currentSportData.sport_name} metrics</h3>
+                            <p className="text-xs text-slate-500">Score each metric 0–10 (decimals allowed).</p>
+                          </div>
+                          <Button onClick={saveScores} disabled={saving || Object.keys(dirty).length === 0} className="bg-lime-400 text-slate-900 hover:bg-lime-300 font-semibold">
+                            <Save className="w-4 h-4 mr-1.5" /> {saving ? 'Saving…' : `Save${Object.keys(dirty).length ? ` (${Object.keys(dirty).length})` : ''}`}
+                          </Button>
+                        </div>
+                        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                          {(currentSportData.metrics_catalog || []).map(m => {
+                            const v = scoreValue(m.key);
+                            const isDirty = dirty[m.key] !== undefined;
+                            return (
+                              <label key={m.key} className={`block px-3 py-2.5 rounded-md border transition ${isDirty ? 'bg-lime-400/5 border-lime-400/40' : 'bg-slate-950/50 border-slate-800'}`}>
+                                <span className="text-xs text-slate-300 block mb-1.5">{m.label}</span>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="number" min="0" max="10" step="0.1"
+                                    value={v}
+                                    onChange={e => setScore(m.key, e.target.value)}
+                                    className="w-16 h-9 bg-slate-800 border border-slate-700 rounded px-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-lime-400"
+                                    placeholder="—"
+                                  />
+                                  <span className="text-slate-500 text-xs">/ 10</span>
+                                  {v !== '' && (
+                                    <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                      <div className={`h-full ${Number(v) >= 7 ? 'bg-lime-400' : Number(v) >= 4 ? 'bg-yellow-400' : 'bg-red-400'}`} style={{ width: `${Number(v) * 10}%` }} />
+                                    </div>
+                                  )}
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </Card>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
   );
 }

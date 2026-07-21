@@ -12,7 +12,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
 import { useAuth } from '@/app/providers';
-import { Calendar, Clock, MapPin, User, Pause, PlayCircle, RefreshCw, CreditCard, Trophy, Sparkles, X } from 'lucide-react';
+import { Calendar, Clock, MapPin, User, Pause, PlayCircle, RefreshCw, CreditCard, Trophy, Sparkles, X, TrendingUp } from 'lucide-react';
 
 export default function DashboardPage() {
   const router = useRouter();
@@ -179,6 +179,9 @@ export default function DashboardPage() {
             )}
           </div>
         </div>
+
+        {/* Performance panel */}
+        <PerformancePanel user={user} />
       </div>
 
       <Dialog open={pauseOpen} onOpenChange={setPauseOpen}>
@@ -198,3 +201,155 @@ export default function DashboardPage() {
     </div>
   );
 }
+
+// ============================
+// Performance panel (view-only)
+// ============================
+function PerformancePanel({ user }) {
+  const [subjects, setSubjects] = useState([]); // {id, label, type}
+  const [selected, setSelected] = useState(null);
+  const [data, setData] = useState(null);
+  const [activeSport, setActiveSport] = useState(null);
+
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
+      const list = [];
+      if (user.role === 'adult' || user.role === 'admin') {
+        list.push({ id: user.id, label: 'You', type: 'user' });
+      }
+      if (user.role === 'parent') {
+        const r = await fetch('/api/children', { credentials: 'include' });
+        const d = await r.json();
+        (d.children || []).forEach(c => list.push({ id: c.id, label: c.child_name, type: 'child' }));
+        if (list.length === 0) list.push({ id: user.id, label: 'You', type: 'user' });
+      }
+      setSubjects(list);
+      if (list[0]) load(list[0]);
+    })();
+  }, [user]);
+
+  const load = async (s) => {
+    setSelected(s);
+    setData(null);
+    const r = await fetch(`/api/athletes/${s.id}/performance`, { credentials: 'include' });
+    if (!r.ok) { setData({ sports: [] }); return; }
+    const d = await r.json();
+    setData(d);
+    setActiveSport(d.sports?.[0]?.sport_id || null);
+  };
+
+  if (!user || !subjects.length) return null;
+
+  const current = data?.sports?.find(s => s.sport_id === activeSport);
+  const hasAny = data?.sports?.length > 0;
+
+  return (
+    <div className="mt-10">
+      <div className="flex items-center gap-2 mb-4">
+        <TrendingUp className="w-5 h-5 text-accent" />
+        <h3 className="font-display font-bold text-2xl">Performance</h3>
+      </div>
+
+      {subjects.length > 1 && (
+        <div className="flex items-center gap-2 flex-wrap mb-4">
+          {subjects.map(s => (
+            <button key={s.id} onClick={() => load(s)} className={`text-sm px-3 py-1.5 rounded-full border transition ${selected?.id === s.id ? 'bg-primary text-primary-foreground border-primary' : 'hover:border-primary/50'}`}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!hasAny ? (
+        <Card className="p-8 rounded-2xl border-dashed text-center">
+          <TrendingUp className="w-10 h-10 mx-auto text-muted-foreground" />
+          <p className="mt-3 text-muted-foreground">No performance data yet.</p>
+          <p className="text-xs text-muted-foreground mt-1">Your coach will start scoring after your first few sessions.</p>
+        </Card>
+      ) : (
+        <>
+          {/* Sport tabs */}
+          <div className="flex items-center gap-1 border-b overflow-x-auto mb-4">
+            {data.sports.map(sp => (
+              <button key={sp.sport_id} onClick={() => setActiveSport(sp.sport_id)} className={`px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${activeSport === sp.sport_id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}>
+                {sp.sport_name}
+              </button>
+            ))}
+          </div>
+
+          {current && (
+            <div className="grid md:grid-cols-3 gap-6">
+              {/* Level card (for kids) */}
+              {selected?.type === 'child' && (
+                <Card className="p-6 rounded-2xl bg-gradient-to-br from-accent/20 to-transparent border-accent/30 md:col-span-1">
+                  <p className="text-xs uppercase tracking-widest text-muted-foreground mb-2">Current level · {current.sport_name}</p>
+                  <div className="flex items-baseline gap-3">
+                    <span className="font-display font-black text-4xl">L{current.level || 1}</span>
+                    <span className="font-display font-bold text-xl">{(current.level_info?.name) || 'SPARK'}</span>
+                  </div>
+                  <p className="text-sm italic text-muted-foreground mt-2">&ldquo;{(current.level_info?.quote) || 'Every champion starts with a spark.'}&rdquo;</p>
+                  <div className="mt-4 flex flex-wrap gap-1">
+                    {(data.levels_catalog || []).map(l => {
+                      const at = (current.level || 1) >= l.level;
+                      return (
+                        <div key={l.level} className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-bold ${at ? 'bg-accent text-black' : 'bg-secondary text-muted-foreground'}`} title={`L${l.level} ${l.name} — ${l.quote}`}>
+                          {l.level}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Card>
+              )}
+
+              {/* Metric grid */}
+              <Card className={`p-6 rounded-2xl ${selected?.type === 'child' ? 'md:col-span-2' : 'md:col-span-3'}`}>
+                <div className="flex items-baseline justify-between mb-4">
+                  <div>
+                    <h4 className="font-semibold text-lg">{current.sport_name} · Metrics</h4>
+                    <p className="text-xs text-muted-foreground">Scored by your coach · 0–10 scale.</p>
+                  </div>
+                  {Object.keys(current.scores || {}).length > 0 && (
+                    <div className="text-right">
+                      <div className="text-xs text-muted-foreground uppercase tracking-widest">Avg</div>
+                      <div className="font-display font-black text-2xl">
+                        {(() => {
+                          const vals = Object.values(current.scores || {});
+                          if (!vals.length) return '—';
+                          return (vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1);
+                        })()}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {Object.keys(current.scores || {}).length === 0 ? (
+                  <div className="py-8 text-center text-sm text-muted-foreground">Your coach hasn&apos;t recorded metrics yet.</div>
+                ) : (
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    {(current.metrics_catalog || []).map(m => {
+                      const v = current.scores?.[m.key];
+                      if (v === undefined) return null;
+                      return (
+                        <div key={m.key} className="flex items-center gap-3">
+                          <div className="flex-1 min-w-0">
+                            <div className="text-sm truncate">{m.label}</div>
+                            <div className="h-1.5 bg-secondary rounded-full overflow-hidden mt-1.5">
+                              <div className={`h-full ${v >= 7 ? 'bg-primary' : v >= 4 ? 'bg-yellow-400' : 'bg-red-400'}`} style={{ width: `${v * 10}%` }} />
+                            </div>
+                          </div>
+                          <div className="font-mono font-semibold w-12 text-right">{v}<span className="text-muted-foreground text-xs">/10</span></div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </Card>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
