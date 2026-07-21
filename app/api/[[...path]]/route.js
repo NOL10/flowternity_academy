@@ -2,7 +2,9 @@ import { NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { getDb, clean } from '@/lib/flowternity/db';
 import { hashPassword, verifyPassword, createToken, setAuthCookie, clearAuthCookie, getSession } from '@/lib/flowternity/auth-server';
-import { SPORTS, MEMBERSHIPS, MAX_PAUSE_DAYS } from '@/lib/flowternity/config';
+import { SPORTS, MEMBERSHIPS, MAX_PAUSE_DAYS, KIDS_LEVELS } from '@/lib/flowternity/config';
+import { metricsForSport, isValidMetricKey, SPORT_METRICS, GENERIC_METRICS } from '@/lib/flowternity/metrics';
+import { createOrder, verifySignature, publicKeyId, getRazorpay } from '@/lib/flowternity/razorpay';
 import { sendPasswordResetEmail, sendWelcomeEmail, sendBookingConfirmationEmail, sendMembershipPurchaseEmail } from '@/lib/flowternity/email';
 
 function cors(res) {
@@ -33,6 +35,31 @@ function publicUser(u) {
   return rest;
 }
 
+async function seedKidLevels(db, { user_id, child_profile_id, sport_ids }) {
+  if (!Array.isArray(sport_ids) || sport_ids.length === 0) return;
+  const now = new Date();
+  for (const sport_id of sport_ids) {
+    const existing = await db.collection('athlete_levels').findOne({
+      user_id, child_profile_id: child_profile_id || null, sport_id,
+    });
+    if (existing) continue;
+    await db.collection('athlete_levels').insertOne({
+      id: uuidv4(),
+      user_id,
+      child_profile_id: child_profile_id || null,
+      sport_id,
+      level: 1,
+      created_at: now,
+      updated_at: now,
+      updated_by: null,
+    });
+  }
+}
+
+function levelInfo(level) {
+  return KIDS_LEVELS.find(l => l.level === Number(level)) || KIDS_LEVELS[0];
+}
+
 async function handleRoute(request, { params }) {
   const { path = [] } = await params;
   const route = `/${path.join('/')}`;
@@ -47,6 +74,233 @@ async function handleRoute(request, { params }) {
     // -------- CONFIG --------
     if (route === '/config' && method === 'GET') {
       return j({ sports: SPORTS, memberships: MEMBERSHIPS });
+    }
+
+    // -------- METRICS CATALOG --------
+    if (route === '/metrics/catalog' && method === 'GET') {
+      const { searchParams } = new URL(request.url);
+      const sport = searchParams.get('sport');
+      if (sport) return j({ sport_id: sport, metrics: metricsForSport(sport), levels: KIDS_LEVELS });
+      const catalog = {};
+      for (const s of SPORTS) catalog[s.id] = metricsForSport(s.id);
+      return j({ catalog, levels: KIDS_LEVELS });
+    }
+
+    // -------- ATHLETE METRICS + LEVELS (view) --------
+    // GET /api/athletes/:user_id/performance -- adult sees self, parent sees child, admin sees anyone
+    const perfMatch = route.match(/^\/athletes\/([^/]+)\/performance$/);
+    if (perfMatch && method === 'GET') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
+      const targetId = perfMatch[1];
+      const isSelf = targetId === auth.user.id;
+      const isAdmin = auth.user.role === 'admin';
+      const isParentOfTarget = auth.user.role === 'parent' && (await db.collection('child_profiles').findOne({ parent_id: auth.user.id, id: targetId }));
+      // Support looking up by child_profile_id too (for parents/admins)
+      const targetChild = await db.collection('child_profiles').findOne({ id: targetId });
+      let user_id_for_metrics = targetId;
+      let child_profile_id_for_metrics = null;
+      if (targetChild) {
+        user_id_for_metrics = targetChild.parent_id;
+        child_profile_id_for_metrics = targetChild.id;
+      }
+      if (!isSelf && !isAdmin && !isParentOfTarget && !(targetChild && targetChild.parent_id === auth.user.id)) {
+        return err('Forbidden', 403);
+      }
+      const metricsDocs = await db.collection('athlete_metrics').find({
+        user_id: user_id_for_metrics,
+        ...(child_profile_id_for_metrics ? { child_profile_id: child_profile_id_for_metrics } : { $or: [{ child_profile_id: null }, { child_profile_id: { $exists: false } }] }),
+      }).toArray();
+      const levelDocs = await db.collection('athlete_levels').find({
+        user_id: user_id_for_metrics,
+        ...(child_profile_id_for_metrics ? { child_profile_id: child_profile_id_for_metrics } : { $or: [{ child_profile_id: null }, { child_profile_id: { $exists: false } }] }),
+      }).toArray();
+      // Enrich per sport
+      const bySport = {};
+      for (const doc of metricsDocs) {
+        bySport[doc.sport_id] = bySport[doc.sport_id] || { sport_id: doc.sport_id, scores: {}, level: null };
+        bySport[doc.sport_id].scores = doc.scores || {};
+        bySport[doc.sport_id].updated_at = doc.updated_at;
+      }
+      for (const doc of levelDocs) {
+        bySport[doc.sport_id] = bySport[doc.sport_id] || { sport_id: doc.sport_id, scores: {}, level: null };
+        bySport[doc.sport_id].level = doc.level;
+        bySport[doc.sport_id].level_info = levelInfo(doc.level);
+      }
+      const sports = Object.values(bySport).map(s => ({
+        ...s,
+        sport_name: SPORTS.find(sp => sp.id === s.sport_id)?.name || s.sport_id,
+        metrics_catalog: metricsForSport(s.sport_id),
+      }));
+      return j({ sports, levels_catalog: KIDS_LEVELS });
+    }
+
+    // -------- CHECKOUT (Razorpay) --------
+    // 1) Authenticated user creates order for existing account
+    if (route === '/checkout/order' && method === 'POST') {
+      const auth = await requireUser(); if (auth.error) return auth.error;
+      const { membership_id, child_profile_id, selected_sports } = await request.json();
+      const mem = MEMBERSHIPS.find(m => m.id === membership_id);
+      if (!mem) return err('Invalid membership');
+      if (mem.category === 'kids' && !child_profile_id) return err('Child profile required for kids membership');
+      if (!getRazorpay()) return err('Payments not configured', 500);
+      try {
+        const order = await createOrder({
+          amountRupees: mem.price,
+          receipt: `sub_${auth.user.id.slice(0, 8)}_${Date.now()}`,
+          notes: { user_id: auth.user.id, membership_id: mem.id },
+        });
+        // Save pending payment
+        await db.collection('payments').insertOne({
+          id: uuidv4(),
+          user_id: auth.user.id,
+          amount: mem.price, currency: 'INR',
+          status: 'created', method: 'razorpay',
+          razorpay_order_id: order.id,
+          membership_id: mem.id,
+          pending_meta: { child_profile_id: child_profile_id || null, selected_sports: selected_sports || [] },
+          created_at: new Date(),
+        });
+        return j({ order_id: order.id, amount: order.amount, currency: order.currency, key_id: publicKeyId(), membership: mem });
+      } catch (e) {
+        return err('Order creation failed: ' + e.message, 500);
+      }
+    }
+
+    // 2) Public: register + create order (kids-friendly)
+    if (route === '/checkout/register-order' && method === 'POST') {
+      const body = await request.json();
+      const { full_name, email, password, phone, role, membership_id, selected_sports, child } = body || {};
+      if (!full_name || !email || !password || !membership_id) return err('full_name, email, password, membership_id are required');
+      if (password.length < 6) return err('Password must be 6+ chars');
+      const mem = MEMBERSHIPS.find(m => m.id === membership_id);
+      if (!mem) return err('Invalid membership');
+      const emailLower = email.toLowerCase();
+      const existing = await db.collection('users').findOne({ email: emailLower });
+      if (existing) return err('Email already registered — please sign in first, then buy a membership.', 409);
+      const isAdmin = emailLower === (process.env.ADMIN_EMAIL || '').toLowerCase();
+      const finalRole = isAdmin ? 'admin' : (role === 'parent' ? 'parent' : 'adult');
+      if (mem.category === 'kids') {
+        if (finalRole !== 'parent') return err('Kids memberships require a parent account.');
+        if (!child || !child.child_name || !child.dob) return err('Child name & DOB required for kids memberships');
+        if (!Array.isArray(selected_sports) || selected_sports.length === 0) return err('Pick at least 1 sport for the kid');
+      }
+      if (!getRazorpay()) return err('Payments not configured', 500);
+
+      const newUser = {
+        id: uuidv4(), role: finalRole, full_name, email: emailLower, phone: phone || '',
+        address: '', emergency_contact: '', photo_url: '',
+        password_hash: hashPassword(password), created_at: new Date(),
+      };
+      await db.collection('users').insertOne(newUser);
+
+      let childProfile = null;
+      if (mem.category === 'kids') {
+        childProfile = {
+          id: uuidv4(), parent_id: newUser.id,
+          child_name: child.child_name, dob: child.dob, gender: child.gender || '',
+          selected_sports: selected_sports.slice(0, 2),
+          created_at: new Date(),
+        };
+        await db.collection('child_profiles').insertOne(childProfile);
+      }
+
+      try {
+        const order = await createOrder({
+          amountRupees: mem.price,
+          receipt: `reg_${newUser.id.slice(0, 8)}_${Date.now()}`,
+          notes: { user_id: newUser.id, membership_id: mem.id, flow: 'register-and-pay' },
+        });
+        await db.collection('payments').insertOne({
+          id: uuidv4(), user_id: newUser.id,
+          amount: mem.price, currency: 'INR',
+          status: 'created', method: 'razorpay',
+          razorpay_order_id: order.id,
+          membership_id: mem.id,
+          pending_meta: {
+            child_profile_id: childProfile ? childProfile.id : null,
+            selected_sports: mem.category === 'kids' ? selected_sports.slice(0, 2) : (Array.isArray(selected_sports) ? selected_sports : []),
+            flow: 'register-and-pay',
+          },
+          created_at: new Date(),
+        });
+        // Sign in the user immediately (they'll only get membership after verify)
+        const token = createToken(newUser);
+        await setAuthCookie(token);
+        return j({
+          order_id: order.id, amount: order.amount, currency: order.currency,
+          key_id: publicKeyId(), membership: mem,
+          user: publicUser(newUser),
+          child_profile: childProfile ? clean(childProfile) : null,
+        });
+      } catch (e) {
+        // Roll back user + child if order creation failed
+        await db.collection('users').deleteOne({ id: newUser.id });
+        if (childProfile) await db.collection('child_profiles').deleteOne({ id: childProfile.id });
+        return err('Order creation failed: ' + e.message, 500);
+      }
+    }
+
+    // 3) Verify signature and activate membership
+    if (route === '/checkout/verify' && method === 'POST') {
+      const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = await request.json();
+      if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return err('Missing payment fields');
+      if (!verifySignature({ order_id: razorpay_order_id, payment_id: razorpay_payment_id, signature: razorpay_signature })) {
+        await db.collection('payments').updateOne({ razorpay_order_id }, { $set: { status: 'failed', failure_reason: 'invalid_signature', updated_at: new Date() } });
+        return err('Invalid signature', 400);
+      }
+      const paymentRec = await db.collection('payments').findOne({ razorpay_order_id });
+      if (!paymentRec) return err('Order not found', 404);
+      if (paymentRec.status === 'success') {
+        // Idempotent - already processed
+        const existing = paymentRec.user_membership_id ? await db.collection('user_memberships').findOne({ id: paymentRec.user_membership_id }) : null;
+        return j({ ok: true, payment: clean(paymentRec), user_membership: existing ? clean(existing) : null, already_processed: true });
+      }
+      const mem = MEMBERSHIPS.find(m => m.id === paymentRec.membership_id);
+      if (!mem) return err('Membership not found', 404);
+      const meta = paymentRec.pending_meta || {};
+      const user = await db.collection('users').findOne({ id: paymentRec.user_id });
+      if (!user) return err('User not found', 404);
+
+      const now = new Date();
+      const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
+      const um = {
+        id: uuidv4(),
+        user_id: user.id,
+        child_profile_id: meta.child_profile_id || null,
+        membership_id: mem.id,
+        membership_snapshot: mem,
+        selected_sports: Array.isArray(meta.selected_sports) ? meta.selected_sports.slice(0, mem.max_sports || 99) : [],
+        start_date: now, expiry_date: expiry,
+        status: 'active', pause_days: 0, paused_at: null,
+        created_at: now,
+      };
+      await db.collection('user_memberships').insertOne(um);
+
+      await db.collection('payments').updateOne({ razorpay_order_id }, {
+        $set: {
+          status: 'success',
+          razorpay_payment_id, razorpay_signature,
+          ref: razorpay_payment_id,
+          user_membership_id: um.id,
+          verified_at: new Date(),
+        },
+      });
+
+      // Seed kid levels for each selected sport
+      if (mem.category === 'kids' && meta.child_profile_id && um.selected_sports?.length) {
+        await seedKidLevels(db, { user_id: user.id, child_profile_id: meta.child_profile_id, sport_ids: um.selected_sports });
+      }
+
+      // Best-effort email
+      try {
+        await sendMembershipPurchaseEmail({
+          to: user.email, name: user.full_name,
+          membershipName: mem.name, months: mem.duration_months, price: mem.price, expiryDate: expiry,
+        });
+      } catch (e) { /* non-fatal */ }
+
+      const updatedPayment = await db.collection('payments').findOne({ razorpay_order_id });
+      return j({ ok: true, payment: clean(updatedPayment), user_membership: clean(um) });
     }
 
     // -------- AUTH --------
@@ -268,6 +522,11 @@ async function handleRoute(request, { params }) {
       };
       await db.collection('user_memberships').insertOne(um);
 
+      // Seed default level 1 for each selected sport (kids)
+      if (mem.category === 'kids' && childProfile && Array.isArray(selected_sports) && selected_sports.length) {
+        await seedKidLevels(db, { user_id: newUser.id, child_profile_id: childProfile.id, sport_ids: selected_sports.slice(0, 2) });
+      }
+
       const payment = {
         id: uuidv4(), user_id: newUser.id, amount: mem.price, currency: 'INR',
         status: 'success', method: 'mock',
@@ -324,6 +583,11 @@ async function handleRoute(request, { params }) {
         created_at: now,
       };
       await db.collection('user_memberships').insertOne(um);
+
+      // Seed default level 1 for kid's selected sports
+      if (mem.category === 'kids' && child_profile_id && Array.isArray(selected_sports) && selected_sports.length) {
+        await seedKidLevels(db, { user_id: auth.user.id, child_profile_id, sport_ids: selected_sports.slice(0, mem.max_sports || 2) });
+      }
 
       const payment = {
         id: uuidv4(),
@@ -647,6 +911,268 @@ async function handleRoute(request, { params }) {
         await db.collection('classes').deleteOne({ id: delMatch[1] });
         await db.collection('bookings').updateMany({ class_id: delMatch[1] }, { $set: { status: 'cancelled', cancelled_at: new Date() } });
         return j({ ok: true });
+      }
+
+      // -------- Bulk class scheduling (recurring) --------
+      // POST /admin/classes/bulk { sport_id, coach_name, capacity, start_date, end_date, weekdays: [0..6], slots: [{start_time, end_time}] }
+      if (route === '/admin/classes/bulk' && method === 'POST') {
+        const body = await request.json();
+        const { sport_id, coach_name, capacity, start_date, end_date, weekdays, slots } = body || {};
+        if (!sport_id || !start_date || !end_date || !capacity) return err('sport_id, start_date, end_date, capacity required');
+        if (!Array.isArray(weekdays) || weekdays.length === 0) return err('weekdays (array of 0-6) required');
+        if (!Array.isArray(slots) || slots.length === 0) return err('slots required');
+        const start = new Date(start_date);
+        const end = new Date(end_date);
+        if (isNaN(start) || isNaN(end) || start > end) return err('Invalid date range');
+        const daysDiff = Math.round((end - start) / (1000 * 60 * 60 * 24));
+        if (daysDiff > 366) return err('Date range too large (max 1 year)');
+        const wkSet = new Set(weekdays.map(Number));
+        const created = [];
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          if (!wkSet.has(d.getDay())) continue;
+          const dateStr = d.toISOString().slice(0, 10);
+          for (const slot of slots) {
+            if (!slot.start_time || !slot.end_time) continue;
+            const cls = {
+              id: uuidv4(),
+              sport_id,
+              coach_name: coach_name || 'Head Coach',
+              date: dateStr,
+              start_time: slot.start_time,
+              end_time: slot.end_time,
+              capacity: parseInt(capacity),
+              created_at: new Date(),
+              created_by: auth.user.id,
+              batch_tag: `bulk_${start_date}_${end_date}`,
+            };
+            created.push(cls);
+          }
+        }
+        if (created.length === 0) return err('No matching dates in range');
+        if (created.length > 500) return err('Would create ' + created.length + ' classes; keep under 500 per request');
+        await db.collection('classes').insertMany(created);
+        return j({ ok: true, count: created.length, classes: created.map(clean) });
+      }
+
+      // POST /admin/classes/bulk-rows { rows: [{sport_id, coach_name, date, start_time, end_time, capacity}] }
+      if (route === '/admin/classes/bulk-rows' && method === 'POST') {
+        const { rows } = await request.json();
+        if (!Array.isArray(rows) || rows.length === 0) return err('rows required');
+        if (rows.length > 500) return err('Max 500 rows per import');
+        const validSports = new Set(SPORTS.map(s => s.id));
+        const inserts = [];
+        const errors = [];
+        rows.forEach((r, i) => {
+          if (!r.sport_id || !validSports.has(r.sport_id)) { errors.push({ row: i + 1, error: 'invalid sport_id' }); return; }
+          if (!r.date || !r.start_time || !r.end_time || !r.capacity) { errors.push({ row: i + 1, error: 'missing fields' }); return; }
+          inserts.push({
+            id: uuidv4(),
+            sport_id: r.sport_id,
+            coach_name: r.coach_name || 'Head Coach',
+            date: r.date,
+            start_time: r.start_time,
+            end_time: r.end_time,
+            capacity: parseInt(r.capacity),
+            created_at: new Date(),
+            created_by: auth.user.id,
+            batch_tag: 'csv_import',
+          });
+        });
+        if (inserts.length) await db.collection('classes').insertMany(inserts);
+        return j({ ok: true, imported: inserts.length, errors });
+      }
+
+      // PATCH /admin/classes/bulk-update { ids: [...], updates: {coach_name, capacity, start_time, end_time} }
+      if (route === '/admin/classes/bulk-update' && method === 'PATCH') {
+        const { ids, updates } = await request.json();
+        if (!Array.isArray(ids) || ids.length === 0) return err('ids required');
+        const allowed = ['coach_name', 'capacity', 'start_time', 'end_time', 'date'];
+        const $set = {};
+        for (const k of allowed) if (updates && updates[k] !== undefined) $set[k] = k === 'capacity' ? parseInt(updates[k]) : updates[k];
+        if (Object.keys($set).length === 0) return err('No valid updates');
+        $set.updated_at = new Date();
+        const r = await db.collection('classes').updateMany({ id: { $in: ids } }, { $set });
+        return j({ ok: true, modified: r.modifiedCount });
+      }
+
+      // DELETE /admin/classes/bulk { ids: [...] } - passed via POST body since DELETE with body is spotty
+      if (route === '/admin/classes/bulk-delete' && method === 'POST') {
+        const { ids } = await request.json();
+        if (!Array.isArray(ids) || ids.length === 0) return err('ids required');
+        await db.collection('classes').deleteMany({ id: { $in: ids } });
+        await db.collection('bookings').updateMany({ class_id: { $in: ids } }, { $set: { status: 'cancelled', cancelled_at: new Date() } });
+        return j({ ok: true, deleted: ids.length });
+      }
+
+      // -------- Bulk games (recurring) --------
+      if (route === '/admin/games/bulk' && method === 'POST') {
+        const body = await request.json();
+        const { sport_id, host_name, max_players, skill_level, start_date, end_date, weekdays, slots, title, description } = body || {};
+        if (!sport_id || !start_date || !end_date || !max_players) return err('sport_id, start_date, end_date, max_players required');
+        if (!Array.isArray(weekdays) || weekdays.length === 0) return err('weekdays required');
+        if (!Array.isArray(slots) || slots.length === 0) return err('slots required');
+        const start = new Date(start_date), end = new Date(end_date);
+        if (isNaN(start) || isNaN(end) || start > end) return err('Invalid date range');
+        const wkSet = new Set(weekdays.map(Number));
+        const sport = SPORTS.find(s => s.id === sport_id);
+        const created = [];
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          if (!wkSet.has(d.getDay())) continue;
+          const dateStr = d.toISOString().slice(0, 10);
+          for (const slot of slots) {
+            if (!slot.start_time || !slot.end_time) continue;
+            created.push({
+              id: uuidv4(),
+              sport_id,
+              title: title || `${sport?.name || sport_id} Game`,
+              description: description || '',
+              date: dateStr,
+              start_time: slot.start_time,
+              end_time: slot.end_time,
+              max_players: parseInt(max_players),
+              host_name: host_name || 'Host',
+              skill_level: skill_level || 'all',
+              created_at: new Date(),
+              created_by: auth.user.id,
+              batch_tag: `bulk_${start_date}_${end_date}`,
+            });
+          }
+        }
+        if (created.length === 0) return err('No matching dates in range');
+        if (created.length > 500) return err('Would create ' + created.length + ' games; keep under 500 per request');
+        await db.collection('games').insertMany(created);
+        return j({ ok: true, count: created.length, games: created.map(clean) });
+      }
+
+      // -------- Athlete performance metrics + levels --------
+      // Target is either user_id (adult) or child_profile_id (kid). We resolve both.
+      const metricsMatch = route.match(/^\/admin\/athletes\/([^/]+)\/metrics$/);
+      if (metricsMatch && method === 'PATCH') {
+        const targetId = metricsMatch[1];
+        const { sport_id, scores } = await request.json();
+        if (!sport_id) return err('sport_id required');
+        if (!scores || typeof scores !== 'object') return err('scores object required');
+        const validSport = SPORTS.find(s => s.id === sport_id);
+        if (!validSport) return err('Invalid sport');
+        // resolve target
+        const child = await db.collection('child_profiles').findOne({ id: targetId });
+        let user_id = targetId, child_profile_id = null;
+        if (child) { user_id = child.parent_id; child_profile_id = child.id; }
+        else {
+          const u = await db.collection('users').findOne({ id: targetId });
+          if (!u) return err('Athlete not found', 404);
+        }
+        // Validate & clamp scores
+        const cleanScores = {};
+        for (const [k, v] of Object.entries(scores)) {
+          if (!isValidMetricKey(sport_id, k)) continue;
+          const num = Number(v);
+          if (isNaN(num)) continue;
+          cleanScores[k] = Math.max(0, Math.min(10, Math.round(num * 10) / 10));
+        }
+        const now = new Date();
+        const existing = await db.collection('athlete_metrics').findOne({
+          user_id, sport_id,
+          ...(child_profile_id ? { child_profile_id } : { child_profile_id: null }),
+        });
+        if (existing) {
+          const merged = { ...(existing.scores || {}), ...cleanScores };
+          await db.collection('athlete_metrics').updateOne({ id: existing.id }, {
+            $set: { scores: merged, updated_at: now, updated_by: auth.user.id },
+          });
+        } else {
+          await db.collection('athlete_metrics').insertOne({
+            id: uuidv4(), user_id, child_profile_id: child_profile_id || null,
+            sport_id, scores: cleanScores,
+            created_at: now, updated_at: now, updated_by: auth.user.id,
+          });
+        }
+        return j({ ok: true, sport_id, scores: cleanScores });
+      }
+
+      const levelMatch = route.match(/^\/admin\/athletes\/([^/]+)\/level$/);
+      if (levelMatch && method === 'PATCH') {
+        const targetId = levelMatch[1];
+        const { sport_id, level } = await request.json();
+        if (!sport_id) return err('sport_id required');
+        const lvl = Number(level);
+        if (!Number.isInteger(lvl) || lvl < 1 || lvl > 7) return err('level must be 1-7');
+        const child = await db.collection('child_profiles').findOne({ id: targetId });
+        let user_id = targetId, child_profile_id = null;
+        if (child) { user_id = child.parent_id; child_profile_id = child.id; }
+        else {
+          const u = await db.collection('users').findOne({ id: targetId });
+          if (!u) return err('Athlete not found', 404);
+        }
+        const now = new Date();
+        const existing = await db.collection('athlete_levels').findOne({
+          user_id, sport_id,
+          ...(child_profile_id ? { child_profile_id } : { child_profile_id: null }),
+        });
+        if (existing) {
+          await db.collection('athlete_levels').updateOne({ id: existing.id }, {
+            $set: { level: lvl, updated_at: now, updated_by: auth.user.id },
+          });
+        } else {
+          await db.collection('athlete_levels').insertOne({
+            id: uuidv4(), user_id, child_profile_id: child_profile_id || null,
+            sport_id, level: lvl,
+            created_at: now, updated_at: now, updated_by: auth.user.id,
+          });
+        }
+        return j({ ok: true, sport_id, level: lvl, level_info: levelInfo(lvl) });
+      }
+
+      // GET /admin/athletes/:target_id/performance - admin view of any athlete
+      const adminPerfMatch = route.match(/^\/admin\/athletes\/([^/]+)\/performance$/);
+      if (adminPerfMatch && method === 'GET') {
+        const targetId = adminPerfMatch[1];
+        const child = await db.collection('child_profiles').findOne({ id: targetId });
+        let user_id = targetId, child_profile_id = null, subject = null;
+        if (child) { user_id = child.parent_id; child_profile_id = child.id; subject = { type: 'child', ...clean(child) }; }
+        else {
+          const u = await db.collection('users').findOne({ id: targetId });
+          if (!u) return err('Athlete not found', 404);
+          subject = { type: 'user', ...publicUser(u) };
+        }
+        const metricsDocs = await db.collection('athlete_metrics').find({
+          user_id, sport_id: { $exists: true },
+          ...(child_profile_id ? { child_profile_id } : { $or: [{ child_profile_id: null }, { child_profile_id: { $exists: false } }] }),
+        }).toArray();
+        const levelDocs = await db.collection('athlete_levels').find({
+          user_id,
+          ...(child_profile_id ? { child_profile_id } : { $or: [{ child_profile_id: null }, { child_profile_id: { $exists: false } }] }),
+        }).toArray();
+        // Also expose the sports the athlete has access to (from their active membership)
+        const memberships = await db.collection('user_memberships').find({ user_id, status: { $in: ['active', 'paused'] } }).toArray();
+        const enrolledSports = new Set();
+        for (const mm of memberships) {
+          if (mm.membership_snapshot?.category === 'kids') {
+            (mm.selected_sports || []).forEach(s => enrolledSports.add(s));
+          } else {
+            // adults: all active sports
+            SPORTS.filter(s => s.status === 'active').forEach(s => enrolledSports.add(s.id));
+          }
+        }
+        const bySport = {};
+        for (const doc of metricsDocs) {
+          bySport[doc.sport_id] = { sport_id: doc.sport_id, scores: doc.scores || {}, level: null };
+        }
+        for (const doc of levelDocs) {
+          bySport[doc.sport_id] = bySport[doc.sport_id] || { sport_id: doc.sport_id, scores: {}, level: null };
+          bySport[doc.sport_id].level = doc.level;
+          bySport[doc.sport_id].level_info = levelInfo(doc.level);
+        }
+        // Ensure enrolled sports appear even if no scores yet
+        for (const sid of enrolledSports) {
+          bySport[sid] = bySport[sid] || { sport_id: sid, scores: {}, level: null };
+        }
+        const sports = Object.values(bySport).map(s => ({
+          ...s,
+          sport_name: SPORTS.find(sp => sp.id === s.sport_id)?.name || s.sport_id,
+          metrics_catalog: metricsForSport(s.sport_id),
+        }));
+        return j({ subject, sports, levels_catalog: KIDS_LEVELS });
       }
 
       if (route === '/admin/stats' && method === 'GET') {

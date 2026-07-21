@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Comprehensive Backend Test for Flowternity Sports Platform
-Tests all API endpoints with detailed assertions and logging
+Flowternity Backend Test - Iteration 5
+Tests Razorpay real checkout, Karate sport, Metrics/Levels, Bulk scheduling
 """
 
 import requests
 import json
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 import sys
 import os
 
 # Load environment variables
-BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'https://run-workflow.preview.emergentagent.com')
+BASE_URL = os.getenv('NEXT_PUBLIC_BASE_URL', 'http://localhost:3000')
 API_BASE = f"{BASE_URL}/api"
 ADMIN_EMAIL = "admin@flowternity.com"
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = "AdminPass1"
+RAZORPAY_KEY_SECRET = "VZ62k8UDDhrU2386MxBMLjUj"
 
 # Test counters
 total_tests = 0
@@ -38,923 +41,658 @@ def assert_test(condition, test_name, details=""):
         log(f"❌ FAIL: {test_name} - {details}", "FAIL")
         return False
 
-def test_health():
-    """Test 1: Health / Config endpoints"""
-    log("\n=== TEST 1: HEALTH / CONFIG ===")
+def compute_razorpay_signature(order_id, payment_id, secret):
+    """Compute HMAC-SHA256 signature for Razorpay verification"""
+    message = f"{order_id}|{payment_id}"
+    signature = hmac.new(
+        secret.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
+
+def test_razorpay_checkout():
+    """Test A: Razorpay Real Checkout"""
+    log("\n=== TEST A: RAZORPAY REAL CHECKOUT ===")
     
-    # Test health endpoint
+    # A1: Test /checkout/order without auth -> 401
     try:
-        resp = requests.get(f"{API_BASE}/")
-        assert_test(resp.status_code == 200, "GET /api/ returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test(data.get('ok') == True, "Health check ok=true", f"Got {data}")
-        assert_test(data.get('app') == 'Flowternity', "Health check app='Flowternity'", f"Got {data.get('app')}")
+        resp = requests.post(f"{API_BASE}/checkout/order", json={"membership_id": "adult_3m"})
+        assert_test(resp.status_code == 401, "POST /checkout/order without auth returns 401", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "GET /api/ health check", str(e))
+        assert_test(False, "POST /checkout/order without auth", str(e))
     
-    # Test config endpoint
+    # A2: Register a new user for testing
+    test_email = f"razorpay_test_{int(datetime.now().timestamp())}@flowternity.com"
+    session = requests.Session()
+    try:
+        resp = session.post(f"{API_BASE}/auth/register", json={
+            "full_name": "Razorpay Test User",
+            "email": test_email,
+            "password": "TestPass123",
+            "role": "adult"
+        })
+        assert_test(resp.status_code == 200, "Register test user for Razorpay", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            log(f"Created test user: {test_email}")
+    except Exception as e:
+        assert_test(False, "Register test user", str(e))
+        return
+    
+    # A3: Test /checkout/order with invalid membership -> 400
+    try:
+        resp = session.post(f"{API_BASE}/checkout/order", json={"membership_id": "invalid_membership"})
+        assert_test(resp.status_code == 400, "POST /checkout/order with invalid membership returns 400", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "POST /checkout/order invalid membership", str(e))
+    
+    # A4: Test /checkout/order with adult_3m -> 200 (real Razorpay order)
+    order_id = None
+    try:
+        resp = session.post(f"{API_BASE}/checkout/order", json={"membership_id": "adult_3m"})
+        assert_test(resp.status_code == 200, "POST /checkout/order adult_3m returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test('order_id' in data, "Response has order_id", f"Got {data.keys()}")
+            assert_test(data.get('amount') == 800000, "Amount is 800000 paise (₹8000)", f"Got {data.get('amount')}")
+            assert_test(data.get('currency') == 'INR', "Currency is INR", f"Got {data.get('currency')}")
+            assert_test(data.get('key_id') == 'rzp_test_TG3JE6R2NsRsfT', "Key ID matches", f"Got {data.get('key_id')}")
+            order_id = data.get('order_id')
+            log(f"Created Razorpay order: {order_id}")
+    except Exception as e:
+        assert_test(False, "POST /checkout/order adult_3m", str(e))
+    
+    # A5: Test /checkout/register-order with new email + adult_3m -> 200
+    new_email = f"register_order_{int(datetime.now().timestamp())}@flowternity.com"
+    new_order_id = None
+    try:
+        resp = requests.post(f"{API_BASE}/checkout/register-order", json={
+            "full_name": "Register Order Test",
+            "email": new_email,
+            "password": "TestPass123",
+            "phone": "9876543210",
+            "role": "adult",
+            "membership_id": "adult_3m"
+        })
+        assert_test(resp.status_code == 200, "POST /checkout/register-order new email returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test('order_id' in data, "Response has order_id", f"Got {data.keys()}")
+            assert_test('user' in data, "Response has user", f"Got {data.keys()}")
+            new_order_id = data.get('order_id')
+            log(f"Created user + order via register-order: {new_email}, order: {new_order_id}")
+    except Exception as e:
+        assert_test(False, "POST /checkout/register-order new email", str(e))
+    
+    # A6: Test /checkout/register-order duplicate email -> 409
+    try:
+        resp = requests.post(f"{API_BASE}/checkout/register-order", json={
+            "full_name": "Duplicate Test",
+            "email": new_email,
+            "password": "TestPass123",
+            "membership_id": "adult_3m"
+        })
+        assert_test(resp.status_code == 409, "POST /checkout/register-order duplicate email returns 409", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "POST /checkout/register-order duplicate email", str(e))
+    
+    # A7: Test /checkout/register-order kids without child -> 400
+    try:
+        resp = requests.post(f"{API_BASE}/checkout/register-order", json={
+            "full_name": "Parent Test",
+            "email": f"parent_no_child_{int(datetime.now().timestamp())}@flowternity.com",
+            "password": "TestPass123",
+            "role": "parent",
+            "membership_id": "kids_1m"
+        })
+        assert_test(resp.status_code == 400, "POST /checkout/register-order kids without child returns 400", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "POST /checkout/register-order kids without child", str(e))
+    
+    # A8: Test /checkout/verify with fake signature -> 400
+    if order_id:
+        try:
+            resp = requests.post(f"{API_BASE}/checkout/verify", json={
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": "pay_FAKE_PAYMENT",
+                "razorpay_signature": "fake_signature_12345"
+            })
+            assert_test(resp.status_code == 400, "POST /checkout/verify fake signature returns 400", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "POST /checkout/verify fake signature", str(e))
+    
+    # A9: Test /checkout/verify with VALID signature -> 200
+    if order_id:
+        try:
+            payment_id = "pay_TEST_MOCK_PAYMENT_123"
+            valid_signature = compute_razorpay_signature(order_id, payment_id, RAZORPAY_KEY_SECRET)
+            log(f"Computed signature: {valid_signature}")
+            
+            resp = requests.post(f"{API_BASE}/checkout/verify", json={
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": payment_id,
+                "razorpay_signature": valid_signature
+            })
+            assert_test(resp.status_code == 200, "POST /checkout/verify valid signature returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('ok') == True, "Verify response ok=true", f"Got {data}")
+                assert_test('payment' in data, "Response has payment", f"Got {data.keys()}")
+                assert_test('user_membership' in data, "Response has user_membership", f"Got {data.keys()}")
+                if 'payment' in data:
+                    assert_test(data['payment'].get('status') == 'success', "Payment status is success", f"Got {data['payment'].get('status')}")
+                if 'user_membership' in data:
+                    assert_test(data['user_membership'].get('status') == 'active', "Membership status is active", f"Got {data['user_membership'].get('status')}")
+        except Exception as e:
+            assert_test(False, "POST /checkout/verify valid signature", str(e))
+    
+    # A10: Test replay same verify -> 200 with already_processed=true
+    if order_id:
+        try:
+            payment_id = "pay_TEST_MOCK_PAYMENT_123"
+            valid_signature = compute_razorpay_signature(order_id, payment_id, RAZORPAY_KEY_SECRET)
+            
+            resp = requests.post(f"{API_BASE}/checkout/verify", json={
+                "razorpay_order_id": order_id,
+                "razorpay_payment_id": payment_id,
+                "razorpay_signature": valid_signature
+            })
+            assert_test(resp.status_code == 200, "POST /checkout/verify replay returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('already_processed') == True, "Replay returns already_processed=true", f"Got {data}")
+        except Exception as e:
+            assert_test(False, "POST /checkout/verify replay", str(e))
+
+def test_karate():
+    """Test B: Karate Sport"""
+    log("\n=== TEST B: KARATE SPORT ===")
+    
+    # B1: Test GET /config includes karate with status='active'
     try:
         resp = requests.get(f"{API_BASE}/config")
-        assert_test(resp.status_code == 200, "GET /api/config returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test(len(data.get('sports', [])) >= 6, "Config has 6+ sports", f"Got {len(data.get('sports', []))} sports")
-        memberships = data.get('memberships', [])
-        assert_test(len(memberships) == 6, "Config has 6 memberships", f"Got {len(memberships)} memberships")
-        
-        # Check specific membership IDs
-        mem_ids = [m['id'] for m in memberships]
-        expected_ids = ['kids_1m', 'kids_6m', 'kids_12m', 'adult_3m', 'adult_6m', 'adult_12m']
-        assert_test(all(mid in mem_ids for mid in expected_ids), "All expected membership IDs present", f"Got {mem_ids}")
+        assert_test(resp.status_code == 200, "GET /config returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            sports = data.get('sports', [])
+            karate = next((s for s in sports if s['id'] == 'karate'), None)
+            assert_test(karate is not None, "Config includes karate sport", f"Sports: {[s['id'] for s in sports]}")
+            if karate:
+                assert_test(karate.get('status') == 'active', "Karate status is active", f"Got {karate.get('status')}")
     except Exception as e:
-        assert_test(False, "GET /api/config", str(e))
+        assert_test(False, "GET /config karate check", str(e))
+    
+    # B2: Test GET /trial/classes?sport=karate -> 200
+    try:
+        resp = requests.get(f"{API_BASE}/trial/classes?sport=karate")
+        assert_test(resp.status_code == 200, "GET /trial/classes?sport=karate returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test('classes' in data, "Response has classes array", f"Got {data.keys()}")
+    except Exception as e:
+        assert_test(False, "GET /trial/classes?sport=karate", str(e))
 
-def test_auth():
-    """Test 2: Authentication flows"""
-    log("\n=== TEST 2: AUTH ===")
+def test_metrics_levels():
+    """Test C: Metrics + Kids Levels"""
+    log("\n=== TEST C: METRICS + KIDS LEVELS ===")
     
-    session = requests.Session()
-    
-    # Test duplicate email registration
+    # C1: Test GET /metrics/catalog -> {catalog, levels}
     try:
-        resp = session.post(f"{API_BASE}/auth/register", json={
-            "full_name": "Test User",
+        resp = requests.get(f"{API_BASE}/metrics/catalog")
+        assert_test(resp.status_code == 200, "GET /metrics/catalog returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test('catalog' in data, "Response has catalog", f"Got {data.keys()}")
+            assert_test('levels' in data, "Response has levels", f"Got {data.keys()}")
+            if 'levels' in data:
+                assert_test(len(data['levels']) == 7, "Levels array has 7 items", f"Got {len(data['levels'])} levels")
+    except Exception as e:
+        assert_test(False, "GET /metrics/catalog", str(e))
+    
+    # C2: Test GET /metrics/catalog?sport=basketball
+    try:
+        resp = requests.get(f"{API_BASE}/metrics/catalog?sport=basketball")
+        assert_test(resp.status_code == 200, "GET /metrics/catalog?sport=basketball returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test(data.get('sport_id') == 'basketball', "Response has sport_id=basketball", f"Got {data.get('sport_id')}")
+            assert_test('metrics' in data, "Response has metrics", f"Got {data.keys()}")
+            assert_test('levels' in data, "Response has levels", f"Got {data.keys()}")
+    except Exception as e:
+        assert_test(False, "GET /metrics/catalog?sport=basketball", str(e))
+    
+    # C3: Test GET /metrics/catalog?sport=futsal -> GENERIC_METRICS
+    try:
+        resp = requests.get(f"{API_BASE}/metrics/catalog?sport=futsal")
+        assert_test(resp.status_code == 200, "GET /metrics/catalog?sport=futsal returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            metrics = data.get('metrics', [])
+            # Check for generic metrics like technique, speed, endurance
+            metric_keys = [m.get('key') for m in metrics]
+            assert_test('technique' in metric_keys, "Futsal has generic metric 'technique'", f"Got {metric_keys}")
+    except Exception as e:
+        assert_test(False, "GET /metrics/catalog?sport=futsal", str(e))
+    
+    # Setup: Create admin, adult user, parent with child for performance tests
+    admin_session = requests.Session()
+    adult_session = requests.Session()
+    parent_session = requests.Session()
+    
+    adult_id = None
+    child_id = None
+    
+    # Login as admin
+    try:
+        resp = admin_session.post(f"{API_BASE}/auth/login", json={
             "email": ADMIN_EMAIL,
-            "password": "test123"
+            "password": ADMIN_PASSWORD
         })
-        assert_test(resp.status_code == 409, "Duplicate email returns 409", f"Got {resp.status_code}")
+        if resp.status_code != 200:
+            # Try to register admin
+            resp = admin_session.post(f"{API_BASE}/auth/register", json={
+                "full_name": "Admin User",
+                "email": ADMIN_EMAIL,
+                "password": ADMIN_PASSWORD,
+                "role": "admin"
+            })
+        assert_test(resp.status_code == 200, "Admin login/register", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "Duplicate email registration", str(e))
+        assert_test(False, "Admin login", str(e))
     
-    # Test short password
+    # Create adult user
+    adult_email = f"adult_perf_{int(datetime.now().timestamp())}@flowternity.com"
     try:
-        resp = session.post(f"{API_BASE}/auth/register", json={
-            "full_name": "Test User",
-            "email": "newuser@test.com",
-            "password": "123"
+        resp = adult_session.post(f"{API_BASE}/auth/register", json={
+            "full_name": "Adult Performance Test",
+            "email": adult_email,
+            "password": "TestPass123",
+            "role": "adult"
         })
-        assert_test(resp.status_code == 400, "Short password returns 400", f"Got {resp.status_code}")
+        assert_test(resp.status_code == 200, "Create adult user for performance test", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            adult_id = resp.json().get('user', {}).get('id')
+            log(f"Created adult user: {adult_email}, ID: {adult_id}")
     except Exception as e:
-        assert_test(False, "Short password validation", str(e))
+        assert_test(False, "Create adult user", str(e))
     
-    # Test wrong password login
+    # Create parent with child
+    parent_email = f"parent_perf_{int(datetime.now().timestamp())}@flowternity.com"
     try:
-        resp = session.post(f"{API_BASE}/auth/login", json={
-            "email": ADMIN_EMAIL,
-            "password": "wrongpassword"
+        resp = parent_session.post(f"{API_BASE}/auth/register", json={
+            "full_name": "Parent Performance Test",
+            "email": parent_email,
+            "password": "TestPass123",
+            "role": "parent"
         })
-        assert_test(resp.status_code == 401, "Wrong password returns 401", f"Got {resp.status_code}")
+        assert_test(resp.status_code == 200, "Create parent user for performance test", f"Got {resp.status_code}")
+        
+        # Create child profile
+        if resp.status_code == 200:
+            resp = parent_session.post(f"{API_BASE}/children", json={
+                "child_name": "Test Child",
+                "dob": "2015-05-15",
+                "gender": "male",
+                "selected_sports": ["basketball", "karate"]
+            })
+            assert_test(resp.status_code == 200, "Create child profile", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                child_id = resp.json().get('child', {}).get('id')
+                log(f"Created child: {child_id}")
     except Exception as e:
-        assert_test(False, "Wrong password login", str(e))
+        assert_test(False, "Create parent with child", str(e))
     
-    # Try to login as admin (or register if doesn't exist)
+    # C4: Test GET /athletes/:target_id/performance - adult viewing self
+    if adult_id:
+        try:
+            resp = adult_session.get(f"{API_BASE}/athletes/{adult_id}/performance")
+            assert_test(resp.status_code == 200, "GET /athletes/:self/performance returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test('sports' in data, "Response has sports", f"Got {data.keys()}")
+                assert_test('levels_catalog' in data, "Response has levels_catalog", f"Got {data.keys()}")
+        except Exception as e:
+            assert_test(False, "GET /athletes/:self/performance", str(e))
+    
+    # C5: Test GET /athletes/:child_id/performance - parent viewing own child
+    if child_id:
+        try:
+            resp = parent_session.get(f"{API_BASE}/athletes/{child_id}/performance")
+            assert_test(resp.status_code == 200, "GET /athletes/:child/performance (parent) returns 200", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "GET /athletes/:child/performance (parent)", str(e))
+    
+    # C6: Test GET /athletes/:child_id/performance - adult viewing another's child -> 403
+    if child_id:
+        try:
+            resp = adult_session.get(f"{API_BASE}/athletes/{child_id}/performance")
+            assert_test(resp.status_code == 403, "GET /athletes/:other_child/performance returns 403", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "GET /athletes/:other_child/performance", str(e))
+    
+    # C7: Test GET /athletes/:target_id/performance - admin viewing anyone
+    if adult_id:
+        try:
+            resp = admin_session.get(f"{API_BASE}/athletes/{adult_id}/performance")
+            assert_test(resp.status_code == 200, "GET /athletes/:any/performance (admin) returns 200", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "GET /athletes/:any/performance (admin)", str(e))
+    
+    # C8: Test PATCH /admin/athletes/:target_id/metrics - admin only
+    if adult_id:
+        try:
+            resp = admin_session.patch(f"{API_BASE}/admin/athletes/{adult_id}/metrics", json={
+                "sport_id": "basketball",
+                "scores": {
+                    "dribbling_control": 8.5,
+                    "layups_left": 7.0,
+                    "free_throw_pct": 9.2,
+                    "unknown_metric": 5.0  # Should be silently dropped
+                }
+            })
+            assert_test(resp.status_code == 200, "PATCH /admin/athletes/:id/metrics returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('ok') == True, "Response ok=true", f"Got {data}")
+                scores = data.get('scores', {})
+                assert_test('dribbling_control' in scores, "Scores include dribbling_control", f"Got {scores}")
+                assert_test('unknown_metric' not in scores, "Unknown metric silently dropped", f"Got {scores}")
+                # Check clamping (values should be 0-10)
+                assert_test(all(0 <= v <= 10 for v in scores.values()), "All scores clamped to 0-10", f"Got {scores}")
+        except Exception as e:
+            assert_test(False, "PATCH /admin/athletes/:id/metrics", str(e))
+    
+    # C9: Test PATCH /admin/athletes/:target_id/metrics - non-admin -> 403
+    if adult_id:
+        try:
+            resp = adult_session.patch(f"{API_BASE}/admin/athletes/{adult_id}/metrics", json={
+                "sport_id": "basketball",
+                "scores": {"dribbling_control": 8.0}
+            })
+            assert_test(resp.status_code == 403, "PATCH /admin/athletes/:id/metrics (non-admin) returns 403", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "PATCH /admin/athletes/:id/metrics (non-admin)", str(e))
+    
+    # C10: Test PATCH /admin/athletes/:target_id/level - admin only
+    if child_id:
+        try:
+            resp = admin_session.patch(f"{API_BASE}/admin/athletes/{child_id}/level", json={
+                "sport_id": "basketball",
+                "level": 3
+            })
+            assert_test(resp.status_code == 200, "PATCH /admin/athletes/:id/level returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('level') == 3, "Level set to 3", f"Got {data.get('level')}")
+                assert_test('level_info' in data, "Response has level_info", f"Got {data.keys()}")
+                if 'level_info' in data:
+                    assert_test(data['level_info'].get('name') == 'RHYTHM', "Level 3 is RHYTHM", f"Got {data['level_info']}")
+        except Exception as e:
+            assert_test(False, "PATCH /admin/athletes/:id/level", str(e))
+    
+    # C11: Test PATCH /admin/athletes/:target_id/level - invalid level -> 400
+    if child_id:
+        try:
+            resp = admin_session.patch(f"{API_BASE}/admin/athletes/{child_id}/level", json={
+                "sport_id": "basketball",
+                "level": 8  # Invalid (must be 1-7)
+            })
+            assert_test(resp.status_code == 400, "PATCH /admin/athletes/:id/level invalid level returns 400", f"Got {resp.status_code}")
+        except Exception as e:
+            assert_test(False, "PATCH /admin/athletes/:id/level invalid", str(e))
+    
+    # C12: Test GET /admin/athletes/:target_id/performance - admin view with enrolled sports
+    if adult_id:
+        try:
+            resp = admin_session.get(f"{API_BASE}/admin/athletes/{adult_id}/performance")
+            assert_test(resp.status_code == 200, "GET /admin/athletes/:id/performance returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test('subject' in data, "Response has subject", f"Got {data.keys()}")
+                assert_test('sports' in data, "Response has sports", f"Got {data.keys()}")
+        except Exception as e:
+            assert_test(False, "GET /admin/athletes/:id/performance", str(e))
+
+def test_bulk_scheduling():
+    """Test D: Bulk Class/Game Scheduling"""
+    log("\n=== TEST D: BULK CLASS/GAME SCHEDULING ===")
+    
+    # Login as admin
     admin_session = requests.Session()
     try:
         resp = admin_session.post(f"{API_BASE}/auth/login", json={
             "email": ADMIN_EMAIL,
             "password": ADMIN_PASSWORD
         })
+        assert_test(resp.status_code == 200, "Admin login for bulk scheduling", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "Admin login", str(e))
+        return
+    
+    # D1: Test POST /admin/classes/bulk - non-admin -> 403
+    try:
+        non_admin_session = requests.Session()
+        resp = non_admin_session.post(f"{API_BASE}/admin/classes/bulk", json={
+            "sport_id": "basketball",
+            "coach_name": "Coach Test",
+            "capacity": 20,
+            "start_date": "2025-01-20",
+            "end_date": "2025-01-24",
+            "weekdays": [1, 3, 5],
+            "slots": [{"start_time": "10:00", "end_time": "11:00"}]
+        })
+        assert_test(resp.status_code == 403, "POST /admin/classes/bulk (non-admin) returns 403", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "POST /admin/classes/bulk (non-admin)", str(e))
+    
+    # D2: Test POST /admin/classes/bulk - valid request
+    created_class_ids = []
+    try:
+        start_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        end_date = (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d")
         
-        if resp.status_code == 401:
-            # Admin doesn't exist, register
-            log("Admin doesn't exist, registering...")
-            resp = admin_session.post(f"{API_BASE}/auth/register", json={
-                "full_name": "Admin",
-                "email": ADMIN_EMAIL,
-                "password": ADMIN_PASSWORD
+        resp = admin_session.post(f"{API_BASE}/admin/classes/bulk", json={
+            "sport_id": "basketball",
+            "coach_name": "Coach Bulk Test",
+            "capacity": 20,
+            "start_date": start_date,
+            "end_date": end_date,
+            "weekdays": [1, 3, 5],  # Mon, Wed, Fri
+            "slots": [
+                {"start_time": "10:00", "end_time": "11:00"},
+                {"start_time": "16:00", "end_time": "17:00"}
+            ]
+        })
+        assert_test(resp.status_code == 200, "POST /admin/classes/bulk returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test(data.get('ok') == True, "Response ok=true", f"Got {data}")
+            assert_test('count' in data, "Response has count", f"Got {data.keys()}")
+            assert_test('classes' in data, "Response has classes array", f"Got {data.keys()}")
+            count = data.get('count', 0)
+            # 2 weeks, 3 days per week, 2 slots = 6 * 2 = 12 classes (approximately)
+            assert_test(count > 0, f"Created {count} classes", f"Got {count}")
+            if 'classes' in data:
+                created_class_ids = [c['id'] for c in data['classes']]
+                log(f"Created {len(created_class_ids)} classes via bulk")
+    except Exception as e:
+        assert_test(False, "POST /admin/classes/bulk", str(e))
+    
+    # D3: Test POST /admin/classes/bulk-rows - mixed valid/invalid
+    try:
+        future_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        resp = admin_session.post(f"{API_BASE}/admin/classes/bulk-rows", json={
+            "rows": [
+                {
+                    "sport_id": "basketball",
+                    "coach_name": "Coach Row 1",
+                    "date": future_date,
+                    "start_time": "09:00",
+                    "end_time": "10:00",
+                    "capacity": 15
+                },
+                {
+                    "sport_id": "invalid_sport",  # Invalid
+                    "date": future_date,
+                    "start_time": "10:00",
+                    "end_time": "11:00",
+                    "capacity": 15
+                },
+                {
+                    "sport_id": "futsal",
+                    "coach_name": "Coach Row 3",
+                    "date": future_date,
+                    "start_time": "11:00",
+                    "end_time": "12:00",
+                    "capacity": 20
+                }
+            ]
+        })
+        assert_test(resp.status_code == 200, "POST /admin/classes/bulk-rows returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test(data.get('imported') == 2, "Imported 2 valid rows", f"Got {data.get('imported')}")
+            assert_test(len(data.get('errors', [])) == 1, "1 error for invalid row", f"Got {data.get('errors')}")
+    except Exception as e:
+        assert_test(False, "POST /admin/classes/bulk-rows", str(e))
+    
+    # D4: Test PATCH /admin/classes/bulk-update
+    if created_class_ids:
+        try:
+            # Update first 2 classes
+            ids_to_update = created_class_ids[:2]
+            resp = admin_session.patch(f"{API_BASE}/admin/classes/bulk-update", json={
+                "ids": ids_to_update,
+                "updates": {
+                    "coach_name": "Coach Updated",
+                    "capacity": 25
+                }
             })
-            assert_test(resp.status_code == 200, "Admin registration successful", f"Got {resp.status_code}")
-        else:
-            assert_test(resp.status_code == 200, "Admin login successful", f"Got {resp.status_code}")
+            assert_test(resp.status_code == 200, "PATCH /admin/classes/bulk-update returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('modified') >= 1, "Modified at least 1 class", f"Got {data.get('modified')}")
+        except Exception as e:
+            assert_test(False, "PATCH /admin/classes/bulk-update", str(e))
+    
+    # D5: Test POST /admin/classes/bulk-delete
+    if created_class_ids:
+        try:
+            # Delete all created classes
+            resp = admin_session.post(f"{API_BASE}/admin/classes/bulk-delete", json={
+                "ids": created_class_ids
+            })
+            assert_test(resp.status_code == 200, "POST /admin/classes/bulk-delete returns 200", f"Got {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                assert_test(data.get('deleted') == len(created_class_ids), f"Deleted {len(created_class_ids)} classes", f"Got {data.get('deleted')}")
+        except Exception as e:
+            assert_test(False, "POST /admin/classes/bulk-delete", str(e))
+    
+    # D6: Test POST /admin/games/bulk
+    try:
+        start_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        end_date = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
         
-        data = resp.json()
-        user = data.get('user', {})
-        assert_test(user.get('role') == 'admin', "User role is admin", f"Got role: {user.get('role')}")
+        resp = admin_session.post(f"{API_BASE}/admin/games/bulk", json={
+            "sport_id": "futsal",
+            "host_name": "Host Bulk Test",
+            "max_players": 10,
+            "skill_level": "intermediate",
+            "title": "Futsal Pickup Game",
+            "description": "Weekly futsal game",
+            "start_date": start_date,
+            "end_date": end_date,
+            "weekdays": [6],  # Saturday
+            "slots": [{"start_time": "18:00", "end_time": "19:30"}]
+        })
+        assert_test(resp.status_code == 200, "POST /admin/games/bulk returns 200", f"Got {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            assert_test(data.get('ok') == True, "Response ok=true", f"Got {data}")
+            assert_test('count' in data, "Response has count", f"Got {data.keys()}")
+            log(f"Created {data.get('count')} games via bulk")
     except Exception as e:
-        assert_test(False, "Admin login/register", str(e))
-    
-    # Test /auth/me
-    try:
-        resp = admin_session.get(f"{API_BASE}/auth/me")
-        assert_test(resp.status_code == 200, "GET /auth/me returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test('user' in data, "/auth/me returns user object", f"Got {data.keys()}")
-    except Exception as e:
-        assert_test(False, "GET /auth/me", str(e))
-    
-    # Test logout
-    try:
-        resp = admin_session.post(f"{API_BASE}/auth/logout")
-        assert_test(resp.status_code == 200, "POST /auth/logout returns 200", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "POST /auth/logout", str(e))
-    
-    # Test /auth/me after logout
-    try:
-        resp = admin_session.get(f"{API_BASE}/auth/me")
-        assert_test(resp.status_code == 401, "GET /auth/me after logout returns 401", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "GET /auth/me after logout", str(e))
-    
-    return admin_session
+        assert_test(False, "POST /admin/games/bulk", str(e))
 
-def test_admin_classes_stats(admin_session):
-    """Test 3: Admin classes and stats"""
-    log("\n=== TEST 3: ADMIN CLASSES + STATS ===")
+def test_regression():
+    """Test E: Regression - Quick check of existing endpoints"""
+    log("\n=== TEST E: REGRESSION ===")
     
-    # Re-login admin
+    # E1: GET /config
     try:
-        resp = admin_session.post(f"{API_BASE}/auth/login", json={
+        resp = requests.get(f"{API_BASE}/config")
+        assert_test(resp.status_code == 200, "REGRESSION: GET /config returns 200", f"Got {resp.status_code}")
+    except Exception as e:
+        assert_test(False, "REGRESSION: GET /config", str(e))
+    
+    # E2: POST /auth/login
+    session = requests.Session()
+    try:
+        resp = session.post(f"{API_BASE}/auth/login", json={
             "email": ADMIN_EMAIL,
             "password": ADMIN_PASSWORD
         })
-        assert_test(resp.status_code == 200, "Admin re-login successful", f"Got {resp.status_code}")
+        assert_test(resp.status_code == 200, "REGRESSION: POST /auth/login returns 200", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "Admin re-login", str(e))
-        return None
+        assert_test(False, "REGRESSION: POST /auth/login", str(e))
     
-    # Create a class for tomorrow
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    class_id = None
+    # E3: GET /dashboard (auth required)
     try:
-        resp = admin_session.post(f"{API_BASE}/admin/classes", json={
-            "sport_id": "basketball",
-            "coach_name": "Coach Test",
-            "date": tomorrow,
-            "start_time": "18:00",
-            "end_time": "19:00",
-            "capacity": 10
-        })
-        assert_test(resp.status_code == 200, "POST /admin/classes returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        class_obj = data.get('class', {})
-        class_id = class_obj.get('id')
-        assert_test(class_id is not None, "Created class has ID", f"Got {class_obj}")
+        resp = session.get(f"{API_BASE}/dashboard")
+        assert_test(resp.status_code == 200, "REGRESSION: GET /dashboard returns 200", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "POST /admin/classes", str(e))
+        assert_test(False, "REGRESSION: GET /dashboard", str(e))
     
-    # Get all classes
+    # E4: GET /admin/classes
     try:
-        resp = admin_session.get(f"{API_BASE}/admin/classes")
-        assert_test(resp.status_code == 200, "GET /admin/classes returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        classes = data.get('classes', [])
-        assert_test(any(c.get('id') == class_id for c in classes), "New class appears in list", f"Class ID {class_id} not found")
+        resp = session.get(f"{API_BASE}/admin/classes")
+        assert_test(resp.status_code == 200, "REGRESSION: GET /admin/classes returns 200", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "GET /admin/classes", str(e))
+        assert_test(False, "REGRESSION: GET /admin/classes", str(e))
     
-    # Get admin stats
+    # E5: GET /admin/stats
     try:
-        resp = admin_session.get(f"{API_BASE}/admin/stats")
-        assert_test(resp.status_code == 200, "GET /admin/stats returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test('total_users' in data, "Stats has total_users", f"Got {data.keys()}")
-        assert_test('active_memberships' in data, "Stats has active_memberships", f"Got {data.keys()}")
-        assert_test('today_classes' in data, "Stats has today_classes", f"Got {data.keys()}")
-        assert_test('active_bookings' in data, "Stats has active_bookings", f"Got {data.keys()}")
-        assert_test(isinstance(data.get('total_users'), int), "total_users is number", f"Got {type(data.get('total_users'))}")
+        resp = session.get(f"{API_BASE}/admin/stats")
+        assert_test(resp.status_code == 200, "REGRESSION: GET /admin/stats returns 200", f"Got {resp.status_code}")
     except Exception as e:
-        assert_test(False, "GET /admin/stats", str(e))
-    
-    return class_id
-
-def test_admin_register_member(admin_session):
-    """Test 4: Admin register member (NEW feature)"""
-    log("\n=== TEST 4: ADMIN REGISTER MEMBER ===")
-    
-    import time
-    timestamp = int(time.time())
-    
-    # 4a: Adult with auto password
-    adult1_email = f"testadult1_{timestamp}@test.com"
-    adult1_password = None
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Test Adult 1",
-            "email": adult1_email,
-            "phone": "9111111111",
-            "role": "adult"
-        })
-        assert_test(resp.status_code == 200, "4a: Adult with auto password returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        user = data.get('user', {})
-        assert_test(user.get('role') == 'adult', "4a: User role is adult", f"Got {user.get('role')}")
-        adult1_password = data.get('temp_password')
-        assert_test(adult1_password and len(adult1_password) >= 8, "4a: temp_password is 8+ chars", f"Got {adult1_password}")
-        assert_test('email_sent' in data, "4a: email_sent field present", f"Got {data.keys()}")
-        
-        # Verify can login with temp password
-        test_session = requests.Session()
-        resp = test_session.post(f"{API_BASE}/auth/login", json={
-            "email": adult1_email,
-            "password": adult1_password
-        })
-        assert_test(resp.status_code == 200, "4a: Can login with temp password", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "4a: Adult with auto password", str(e))
-    
-    # 4b: Adult with membership
-    adult2_email = f"testadult2_{timestamp}@test.com"
-    adult2_user_id = None
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Test Adult 2",
-            "email": adult2_email,
-            "role": "adult",
-            "membership_id": "adult_3m"
-        })
-        assert_test(resp.status_code == 200, "4b: Adult with membership returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        membership = data.get('membership')
-        assert_test(membership is not None, "4b: Membership created", f"Got {data.keys()}")
-        assert_test(membership.get('status') == 'active', "4b: Membership status is active", f"Got {membership.get('status')}")
-        adult2_user_id = data.get('user', {}).get('id')
-        adult2_password = data.get('temp_password')
-        
-        # Login as this user and check dashboard
-        test_session = requests.Session()
-        resp = test_session.post(f"{API_BASE}/auth/login", json={
-            "email": adult2_email,
-            "password": adult2_password
-        })
-        assert_test(resp.status_code == 200, "4b: Can login as new user", f"Got {resp.status_code}")
-        
-        resp = test_session.get(f"{API_BASE}/dashboard")
-        assert_test(resp.status_code == 200, "4b: Dashboard accessible", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test(data.get('active_membership') is not None, "4b: Dashboard shows active_membership", f"Got {data.keys()}")
-    except Exception as e:
-        assert_test(False, "4b: Adult with membership", str(e))
-    
-    # 4c: Parent + child + kids membership
-    parent_email = f"testparent_{timestamp}@test.com"
-    parent_password = None
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Test Parent",
-            "email": parent_email,
-            "role": "parent",
-            "child": {
-                "child_name": "Kid",
-                "dob": "2015-01-01",
-                "gender": "Male"
-            },
-            "membership_id": "kids_1m",
-            "selected_sports": ["basketball"]
-        })
-        assert_test(resp.status_code == 200, "4c: Parent+child+membership returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        user = data.get('user', {})
-        assert_test(user.get('role') == 'parent', "4c: User role is parent", f"Got {user.get('role')}")
-        child_profile = data.get('child_profile')
-        assert_test(child_profile is not None, "4c: Child profile created", f"Got {data.keys()}")
-        assert_test('basketball' in child_profile.get('selected_sports', []), "4c: Child has basketball in selected_sports", f"Got {child_profile.get('selected_sports')}")
-        membership = data.get('membership')
-        assert_test(membership is not None, "4c: Membership created", f"Got {data.keys()}")
-        assert_test(membership.get('membership_id') == 'kids_1m', "4c: Membership is kids_1m", f"Got {membership.get('membership_id')}")
-        parent_password = data.get('temp_password')
-        
-        # Login as parent and check children
-        test_session = requests.Session()
-        resp = test_session.post(f"{API_BASE}/auth/login", json={
-            "email": parent_email,
-            "password": parent_password
-        })
-        assert_test(resp.status_code == 200, "4c: Can login as parent", f"Got {resp.status_code}")
-        
-        resp = test_session.get(f"{API_BASE}/children")
-        assert_test(resp.status_code == 200, "4c: GET /children accessible", f"Got {resp.status_code}")
-        data = resp.json()
-        children = data.get('children', [])
-        assert_test(len(children) > 0, "4c: Parent has children", f"Got {len(children)} children")
-    except Exception as e:
-        assert_test(False, "4c: Parent+child+membership", str(e))
-    
-    # 4d: With explicit password
-    adult4_email = f"testadult4_{timestamp}@test.com"
-    custom_password = "customPass123"
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Test Adult 4",
-            "email": adult4_email,
-            "role": "adult",
-            "password": custom_password
-        })
-        assert_test(resp.status_code == 200, "4d: With explicit password returns 200", f"Got {resp.status_code}")
-        
-        # Verify can login with custom password
-        test_session = requests.Session()
-        resp = test_session.post(f"{API_BASE}/auth/login", json={
-            "email": adult4_email,
-            "password": custom_password
-        })
-        assert_test(resp.status_code == 200, "4d: Can login with custom password", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "4d: With explicit password", str(e))
-    
-    # 4e: Duplicate email
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Duplicate",
-            "email": adult1_email,
-            "role": "adult"
-        })
-        assert_test(resp.status_code == 409, "4e: Duplicate email returns 409", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "4e: Duplicate email", str(e))
-    
-    # 4f: Missing required fields
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/members", json={
-            "role": "adult"
-        })
-        assert_test(resp.status_code == 400, "4f: Missing full_name/email returns 400", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "4f: Missing required fields", str(e))
-    
-    # 4g: Non-admin trying to create member
-    try:
-        non_admin_session = requests.Session()
-        resp = non_admin_session.post(f"{API_BASE}/auth/register", json={
-            "full_name": "Regular User",
-            "email": f"regular_{timestamp}@test.com",
-            "password": "test123"
-        })
-        
-        resp = non_admin_session.post(f"{API_BASE}/admin/members", json={
-            "full_name": "Should Fail",
-            "email": f"shouldfail_{timestamp}@test.com",
-            "role": "adult"
-        })
-        assert_test(resp.status_code == 403, "4g: Non-admin returns 403", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "4g: Non-admin access", str(e))
-    
-    return adult2_email, adult2_password, parent_email, parent_password
-
-def test_member_flow(member_email, member_password, class_id):
-    """Test 5: Member flow (checkout, dashboard, bookings)"""
-    log("\n=== TEST 5: MEMBER FLOW ===")
-    
-    member_session = requests.Session()
-    
-    # Login as member
-    try:
-        resp = member_session.post(f"{API_BASE}/auth/login", json={
-            "email": member_email,
-            "password": member_password
-        })
-        assert_test(resp.status_code == 200, "Member login successful", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Member login", str(e))
-        return
-    
-    # Add another membership
-    try:
-        resp = member_session.post(f"{API_BASE}/checkout/mock", json={
-            "membership_id": "adult_6m"
-        })
-        assert_test(resp.status_code == 200, "POST /checkout/mock adult_6m returns 200", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "POST /checkout/mock", str(e))
-    
-    # Get dashboard
-    try:
-        resp = member_session.get(f"{API_BASE}/dashboard")
-        assert_test(resp.status_code == 200, "GET /dashboard returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test(data.get('active_membership') is not None, "Dashboard has active_membership", f"Got {data.keys()}")
-        payments = data.get('payments', [])
-        assert_test(len(payments) >= 1, "Dashboard has payments", f"Got {len(payments)} payments")
-    except Exception as e:
-        assert_test(False, "GET /dashboard", str(e))
-    
-    # Get classes
-    booking_id = None
-    try:
-        resp = member_session.get(f"{API_BASE}/classes")
-        assert_test(resp.status_code == 200, "GET /classes returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        classes = data.get('classes', [])
-        assert_test(len(classes) > 0, "Classes list not empty", f"Got {len(classes)} classes")
-        
-        # Find the basketball class
-        basketball_class = next((c for c in classes if c.get('id') == class_id), None)
-        if basketball_class:
-            assert_test(basketball_class.get('sport') is not None, "Class has sport enriched", f"Got {basketball_class.get('sport')}")
-            assert_test(basketball_class.get('booked_count') >= 0, "Class has booked_count", f"Got {basketball_class.get('booked_count')}")
-            assert_test(basketball_class.get('is_booked') == False, "Class is_booked=false initially", f"Got {basketball_class.get('is_booked')}")
-    except Exception as e:
-        assert_test(False, "GET /classes", str(e))
-    
-    # Book the class
-    try:
-        resp = member_session.post(f"{API_BASE}/bookings", json={
-            "class_id": class_id
-        })
-        assert_test(resp.status_code == 200, "POST /bookings returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        booking = data.get('booking', {})
-        booking_id = booking.get('id')
-        assert_test(booking_id is not None, "Booking has ID", f"Got {booking}")
-    except Exception as e:
-        assert_test(False, "POST /bookings", str(e))
-    
-    # Try duplicate booking
-    try:
-        resp = member_session.post(f"{API_BASE}/bookings", json={
-            "class_id": class_id
-        })
-        assert_test(resp.status_code == 409, "Duplicate booking returns 409", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Duplicate booking", str(e))
-    
-    # Check dashboard for upcoming classes
-    try:
-        resp = member_session.get(f"{API_BASE}/dashboard")
-        assert_test(resp.status_code == 200, "GET /dashboard after booking returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        upcoming = data.get('upcoming_classes', [])
-        assert_test(len(upcoming) >= 1, "Dashboard has upcoming_classes", f"Got {len(upcoming)} upcoming classes")
-        if len(upcoming) > 0:
-            assert_test(upcoming[0].get('sport_name') == 'Basketball', "Upcoming class is Basketball", f"Got {upcoming[0].get('sport_name')}")
-    except Exception as e:
-        assert_test(False, "Dashboard upcoming classes", str(e))
-    
-    # Cancel booking
-    if booking_id:
-        try:
-            resp = member_session.post(f"{API_BASE}/bookings/{booking_id}/cancel")
-            assert_test(resp.status_code == 200, "POST /bookings/:id/cancel returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "POST /bookings/:id/cancel", str(e))
-    
-    return member_session
-
-def test_pause_resume(member_session):
-    """Test 6: Pause/Resume membership"""
-    log("\n=== TEST 6: PAUSE / RESUME ===")
-    
-    # Pause membership
-    try:
-        resp = member_session.post(f"{API_BASE}/memberships/pause", json={
-            "days": 30
-        })
-        assert_test(resp.status_code == 200, "POST /memberships/pause returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test(data.get('paused_days') == 30, "Paused for 30 days", f"Got {data.get('paused_days')}")
-    except Exception as e:
-        assert_test(False, "POST /memberships/pause", str(e))
-    
-    # Try to pause again (should fail)
-    try:
-        resp = member_session.post(f"{API_BASE}/memberships/pause", json={
-            "days": 30
-        })
-        assert_test(resp.status_code == 400, "Second pause returns 400", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Second pause attempt", str(e))
-    
-    # Resume membership
-    old_expiry = None
-    try:
-        # Get current expiry
-        resp = member_session.get(f"{API_BASE}/dashboard")
-        data = resp.json()
-        active_mem = data.get('active_membership') or data.get('memberships', [{}])[0]
-        old_expiry = active_mem.get('expiry_date')
-        
-        resp = member_session.post(f"{API_BASE}/memberships/resume")
-        assert_test(resp.status_code == 200, "POST /memberships/resume returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        new_expiry = data.get('new_expiry')
-        assert_test(new_expiry is not None, "Resume returns new_expiry", f"Got {data}")
-        
-        if old_expiry and new_expiry:
-            from datetime import datetime
-            old_date = datetime.fromisoformat(old_expiry.replace('Z', '+00:00'))
-            new_date = datetime.fromisoformat(new_expiry.replace('Z', '+00:00'))
-            assert_test(new_date > old_date, "New expiry is after old expiry", f"Old: {old_expiry}, New: {new_expiry}")
-    except Exception as e:
-        assert_test(False, "POST /memberships/resume", str(e))
-
-def test_kids_sport_restriction(parent_email, parent_password, admin_session):
-    """Test 7: Kids sport restriction"""
-    log("\n=== TEST 7: KIDS SPORT RESTRICTION ===")
-    
-    # Create a futsal class as admin
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    futsal_class_id = None
-    basketball_class_id = None
-    
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/classes", json={
-            "sport_id": "futsal",
-            "coach_name": "Coach Futsal",
-            "date": tomorrow,
-            "start_time": "19:00",
-            "end_time": "20:00",
-            "capacity": 10
-        })
-        assert_test(resp.status_code == 200, "Created futsal class", f"Got {resp.status_code}")
-        data = resp.json()
-        futsal_class_id = data.get('class', {}).get('id')
-    except Exception as e:
-        assert_test(False, "Create futsal class", str(e))
-    
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/classes", json={
-            "sport_id": "basketball",
-            "coach_name": "Coach Basketball",
-            "date": tomorrow,
-            "start_time": "20:00",
-            "end_time": "21:00",
-            "capacity": 10
-        })
-        assert_test(resp.status_code == 200, "Created basketball class", f"Got {resp.status_code}")
-        data = resp.json()
-        basketball_class_id = data.get('class', {}).get('id')
-    except Exception as e:
-        assert_test(False, "Create basketball class", str(e))
-    
-    # Login as parent
-    parent_session = requests.Session()
-    try:
-        resp = parent_session.post(f"{API_BASE}/auth/login", json={
-            "email": parent_email,
-            "password": parent_password
-        })
-        assert_test(resp.status_code == 200, "Parent login successful", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Parent login", str(e))
-        return
-    
-    # Try to book futsal class (should fail)
-    if futsal_class_id:
-        try:
-            resp = parent_session.post(f"{API_BASE}/bookings", json={
-                "class_id": futsal_class_id
-            })
-            assert_test(resp.status_code == 403, "Booking futsal (not in selection) returns 403", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "Book futsal class (should fail)", str(e))
-    
-    # Try to book basketball class (should succeed)
-    if basketball_class_id:
-        try:
-            resp = parent_session.post(f"{API_BASE}/bookings", json={
-                "class_id": basketball_class_id
-            })
-            assert_test(resp.status_code == 200, "Booking basketball (in selection) returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "Book basketball class", str(e))
-
-def test_forgot_reset_password():
-    """Test 8: Forgot/Reset password"""
-    log("\n=== TEST 8: FORGOT/RESET PASSWORD ===")
-    
-    import time
-    timestamp = int(time.time())
-    test_email = f"resettest_{timestamp}@test.com"
-    
-    # Register a test user
-    test_session = requests.Session()
-    try:
-        resp = test_session.post(f"{API_BASE}/auth/register", json={
-            "full_name": "Reset Test User",
-            "email": test_email,
-            "password": "oldpass123"
-        })
-        assert_test(resp.status_code == 200, "Test user registered", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Register test user for reset", str(e))
-        return
-    
-    # Request password reset
-    reset_token = None
-    try:
-        resp = requests.post(f"{API_BASE}/auth/forgot", json={
-            "email": test_email
-        })
-        assert_test(resp.status_code == 200, "POST /auth/forgot returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test('reset_link' in data, "Forgot response has reset_link", f"Got {data.keys()}")
-        assert_test('token' in data, "Forgot response has token", f"Got {data.keys()}")
-        assert_test('email_sent' in data, "Forgot response has email_sent", f"Got {data.keys()}")
-        reset_token = data.get('token')
-    except Exception as e:
-        assert_test(False, "POST /auth/forgot", str(e))
-    
-    # Try reset with invalid token
-    try:
-        resp = requests.post(f"{API_BASE}/auth/reset", json={
-            "token": "invalid_token_12345",
-            "password": "newpass123"
-        })
-        assert_test(resp.status_code == 400, "Reset with invalid token returns 400", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Reset with invalid token", str(e))
-    
-    # Reset with valid token
-    if reset_token:
-        try:
-            resp = requests.post(f"{API_BASE}/auth/reset", json={
-                "token": reset_token,
-                "password": "newpass123"
-            })
-            assert_test(resp.status_code == 200, "POST /auth/reset returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "POST /auth/reset", str(e))
-        
-        # Try login with old password (should fail)
-        try:
-            resp = test_session.post(f"{API_BASE}/auth/login", json={
-                "email": test_email,
-                "password": "oldpass123"
-            })
-            assert_test(resp.status_code == 401, "Login with old password returns 401", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "Login with old password", str(e))
-        
-        # Login with new password (should succeed)
-        try:
-            resp = test_session.post(f"{API_BASE}/auth/login", json={
-                "email": test_email,
-                "password": "newpass123"
-            })
-            assert_test(resp.status_code == 200, "Login with new password returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "Login with new password", str(e))
-
-def test_profile(member_session):
-    """Test 9: Profile endpoints"""
-    log("\n=== TEST 9: PROFILE ===")
-    
-    # Update profile
-    try:
-        resp = member_session.patch(f"{API_BASE}/profile", json={
-            "full_name": "Updated Name",
-            "phone": "9333333333",
-            "address": "Some Address",
-            "emergency_contact": "Mom"
-        })
-        assert_test(resp.status_code == 200, "PATCH /profile returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        user = data.get('user', {})
-        assert_test(user.get('full_name') == 'Updated Name', "Profile updated full_name", f"Got {user.get('full_name')}")
-        assert_test(user.get('phone') == '9333333333', "Profile updated phone", f"Got {user.get('phone')}")
-    except Exception as e:
-        assert_test(False, "PATCH /profile", str(e))
-    
-    # Get full profile
-    try:
-        resp = member_session.get(f"{API_BASE}/profile/full")
-        assert_test(resp.status_code == 200, "GET /profile/full returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        assert_test('user' in data, "Full profile has user", f"Got {data.keys()}")
-        assert_test('children' in data, "Full profile has children", f"Got {data.keys()}")
-        assert_test('memberships' in data, "Full profile has memberships", f"Got {data.keys()}")
-        assert_test('payments' in data, "Full profile has payments", f"Got {data.keys()}")
-    except Exception as e:
-        assert_test(False, "GET /profile/full", str(e))
-
-def test_admin_sub_features(admin_session):
-    """Test 10: Admin sub-features (coaches, announcements, members, attendance, payments)"""
-    log("\n=== TEST 10: ADMIN SUB-FEATURES ===")
-    
-    # Create coach
-    coach_id = None
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/coaches", json={
-            "full_name": "Coach A",
-            "email": "coacha@x.com",
-            "sports": ["basketball"],
-            "bio": "Experienced coach"
-        })
-        assert_test(resp.status_code == 200, "POST /admin/coaches returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        coach = data.get('coach', {})
-        coach_id = coach.get('id')
-        assert_test(coach_id is not None, "Coach has ID", f"Got {coach}")
-    except Exception as e:
-        assert_test(False, "POST /admin/coaches", str(e))
-    
-    # Get coaches (admin)
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/coaches")
-        assert_test(resp.status_code == 200, "GET /admin/coaches returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        coaches = data.get('coaches', [])
-        assert_test(any(c.get('id') == coach_id for c in coaches), "Coach appears in admin list", f"Coach ID {coach_id} not found")
-    except Exception as e:
-        assert_test(False, "GET /admin/coaches", str(e))
-    
-    # Get coaches (public)
-    try:
-        resp = requests.get(f"{API_BASE}/coaches")
-        assert_test(resp.status_code == 200, "GET /coaches (public) returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        coaches = data.get('coaches', [])
-        assert_test(any(c.get('id') == coach_id for c in coaches), "Coach visible in public list", f"Coach ID {coach_id} not found")
-    except Exception as e:
-        assert_test(False, "GET /coaches (public)", str(e))
-    
-    # Delete coach
-    if coach_id:
-        try:
-            resp = admin_session.delete(f"{API_BASE}/admin/coaches/{coach_id}")
-            assert_test(resp.status_code == 200, "DELETE /admin/coaches/:id returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "DELETE /admin/coaches/:id", str(e))
-    
-    # Create announcement
-    announcement_id = None
-    try:
-        resp = admin_session.post(f"{API_BASE}/admin/announcements", json={
-            "title": "Holiday",
-            "message": "Closed Sunday"
-        })
-        assert_test(resp.status_code == 200, "POST /admin/announcements returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        announcement = data.get('announcement', {})
-        announcement_id = announcement.get('id')
-        assert_test(announcement_id is not None, "Announcement has ID", f"Got {announcement}")
-    except Exception as e:
-        assert_test(False, "POST /admin/announcements", str(e))
-    
-    # Get announcements
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/announcements")
-        assert_test(resp.status_code == 200, "GET /admin/announcements returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        announcements = data.get('announcements', [])
-        assert_test(any(a.get('id') == announcement_id for a in announcements), "Announcement appears in list", f"Announcement ID {announcement_id} not found")
-    except Exception as e:
-        assert_test(False, "GET /admin/announcements", str(e))
-    
-    # Delete announcement
-    if announcement_id:
-        try:
-            resp = admin_session.delete(f"{API_BASE}/admin/announcements/{announcement_id}")
-            assert_test(resp.status_code == 200, "DELETE /admin/announcements/:id returns 200", f"Got {resp.status_code}")
-        except Exception as e:
-            assert_test(False, "DELETE /admin/announcements/:id", str(e))
-    
-    # Get members with search
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/members?q=Test")
-        assert_test(resp.status_code == 200, "GET /admin/members?q=Test returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        members = data.get('members', [])
-        assert_test(isinstance(members, list), "Members is a list", f"Got {type(members)}")
-    except Exception as e:
-        assert_test(False, "GET /admin/members with search", str(e))
-    
-    # Get member detail
-    try:
-        # Get a user ID first
-        resp = admin_session.get(f"{API_BASE}/admin/members")
-        data = resp.json()
-        members = data.get('members', [])
-        if len(members) > 0:
-            user_id = members[0].get('id')
-            resp = admin_session.get(f"{API_BASE}/admin/members/{user_id}/detail")
-            assert_test(resp.status_code == 200, "GET /admin/members/:id/detail returns 200", f"Got {resp.status_code}")
-            data = resp.json()
-            assert_test('user' in data, "Member detail has user", f"Got {data.keys()}")
-            assert_test('memberships' in data, "Member detail has memberships", f"Got {data.keys()}")
-            assert_test('payments' in data, "Member detail has payments", f"Got {data.keys()}")
-            assert_test('bookings' in data, "Member detail has bookings", f"Got {data.keys()}")
-    except Exception as e:
-        assert_test(False, "GET /admin/members/:id/detail", str(e))
-    
-    # Update member
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/members")
-        data = resp.json()
-        members = data.get('members', [])
-        if len(members) > 0:
-            user_id = members[0].get('id')
-            resp = admin_session.patch(f"{API_BASE}/admin/members/{user_id}", json={
-                "full_name": "Renamed User"
-            })
-            assert_test(resp.status_code == 200, "PATCH /admin/members/:id returns 200", f"Got {resp.status_code}")
-            data = resp.json()
-            user = data.get('user', {})
-            assert_test(user.get('full_name') == 'Renamed User', "Member name updated", f"Got {user.get('full_name')}")
-    except Exception as e:
-        assert_test(False, "PATCH /admin/members/:id", str(e))
-    
-    # Deactivate member
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/members")
-        data = resp.json()
-        members = data.get('members', [])
-        # Find a member with active membership
-        target_user_id = None
-        for m in members:
-            if m.get('latest_membership') and m.get('latest_membership', {}).get('status') == 'active':
-                target_user_id = m.get('id')
-                break
-        
-        if target_user_id:
-            resp = admin_session.post(f"{API_BASE}/admin/members/{target_user_id}/deactivate")
-            assert_test(resp.status_code == 200, "POST /admin/members/:id/deactivate returns 200", f"Got {resp.status_code}")
-            
-            # Verify memberships are expired
-            resp = admin_session.get(f"{API_BASE}/admin/members/{target_user_id}/detail")
-            data = resp.json()
-            memberships = data.get('memberships', [])
-            active_count = sum(1 for m in memberships if m.get('status') == 'active')
-            assert_test(active_count == 0, "No active memberships after deactivation", f"Found {active_count} active memberships")
-    except Exception as e:
-        assert_test(False, "POST /admin/members/:id/deactivate", str(e))
-    
-    # Get payments
-    try:
-        resp = admin_session.get(f"{API_BASE}/admin/payments")
-        assert_test(resp.status_code == 200, "GET /admin/payments returns 200", f"Got {resp.status_code}")
-        data = resp.json()
-        payments = data.get('payments', [])
-        assert_test(isinstance(payments, list), "Payments is a list", f"Got {type(payments)}")
-        if len(payments) > 0:
-            assert_test('user_name' in payments[0], "Payment has user_name enriched", f"Got {payments[0].keys()}")
-    except Exception as e:
-        assert_test(False, "GET /admin/payments", str(e))
-
-def test_security():
-    """Test 11: Security checks"""
-    log("\n=== TEST 11: SECURITY ===")
-    
-    # Test without cookie
-    try:
-        resp = requests.get(f"{API_BASE}/dashboard")
-        assert_test(resp.status_code == 401, "GET /dashboard without auth returns 401", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Dashboard without auth", str(e))
-    
-    # Test non-admin trying admin endpoint
-    try:
-        non_admin_session = requests.Session()
-        import time
-        timestamp = int(time.time())
-        resp = non_admin_session.post(f"{API_BASE}/auth/register", json={
-            "full_name": "Non Admin",
-            "email": f"nonadmin_{timestamp}@test.com",
-            "password": "test123"
-        })
-        
-        resp = non_admin_session.get(f"{API_BASE}/admin/stats")
-        assert_test(resp.status_code == 403, "Non-admin trying /admin/* returns 403", f"Got {resp.status_code}")
-    except Exception as e:
-        assert_test(False, "Non-admin access to admin endpoint", str(e))
+        assert_test(False, "REGRESSION: GET /admin/stats", str(e))
 
 def main():
     """Run all tests"""
     log("=" * 80)
-    log("FLOWTERNITY BACKEND COMPREHENSIVE TEST")
-    log(f"Base URL: {BASE_URL}")
-    log(f"API Base: {API_BASE}")
+    log("FLOWTERNITY BACKEND TEST - ITERATION 5")
+    log("Testing: Razorpay, Karate, Metrics/Levels, Bulk Scheduling")
     log("=" * 80)
     
-    # Run tests in sequence
-    test_health()
-    admin_session = test_auth()
-    class_id = test_admin_classes_stats(admin_session)
-    adult2_email, adult2_password, parent_email, parent_password = test_admin_register_member(admin_session)
+    test_razorpay_checkout()
+    test_karate()
+    test_metrics_levels()
+    test_bulk_scheduling()
+    test_regression()
     
-    if adult2_email and adult2_password and class_id:
-        member_session = test_member_flow(adult2_email, adult2_password, class_id)
-        if member_session:
-            test_pause_resume(member_session)
-            test_profile(member_session)
-    
-    if parent_email and parent_password and admin_session:
-        test_kids_sport_restriction(parent_email, parent_password, admin_session)
-    
-    test_forgot_reset_password()
-    test_admin_sub_features(admin_session)
-    test_security()
-    
-    # Print summary
+    # Summary
     log("\n" + "=" * 80)
     log("TEST SUMMARY")
     log("=" * 80)
     log(f"Total Tests: {total_tests}")
     log(f"Passed: {passed_tests}")
     log(f"Failed: {len(failed_tests)}")
-    log(f"Pass Rate: {(passed_tests/total_tests*100):.1f}%")
     
     if failed_tests:
-        log("\n" + "=" * 80)
-        log("FAILED TESTS:")
-        log("=" * 80)
-        for i, failure in enumerate(failed_tests, 1):
-            log(f"{i}. {failure}")
+        log("\nFailed Tests:")
+        for failure in failed_tests:
+            log(f"  ❌ {failure}", "FAIL")
     
-    log("\n" + "=" * 80)
+    success_rate = (passed_tests / total_tests * 100) if total_tests > 0 else 0
+    log(f"\nSuccess Rate: {success_rate:.1f}%")
     
-    # Exit with appropriate code
-    sys.exit(0 if len(failed_tests) == 0 else 1)
+    if len(failed_tests) == 0:
+        log("\n🎉 ALL TESTS PASSED!", "SUCCESS")
+        sys.exit(0)
+    else:
+        log(f"\n⚠️  {len(failed_tests)} TEST(S) FAILED", "FAIL")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
