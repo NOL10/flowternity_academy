@@ -4,7 +4,7 @@ import { getDb, clean } from '@/lib/flowternity/db';
 import { hashPassword, verifyPassword, createToken, setAuthCookie, clearAuthCookie, getSession } from '@/lib/flowternity/auth-server';
 import { SPORTS, MEMBERSHIPS, MAX_PAUSE_DAYS, KIDS_LEVELS } from '@/lib/flowternity/config';
 import { metricsForSport, isValidMetricKey, SPORT_METRICS, GENERIC_METRICS } from '@/lib/flowternity/metrics';
-import { createOrder, verifySignature, publicKeyId, getRazorpay } from '@/lib/flowternity/razorpay';
+import { createOrder, verifySignature, publicKeyId, getRazorpay, verifyWebhookSignature, refundPayment } from '@/lib/flowternity/razorpay';
 import { sendPasswordResetEmail, sendWelcomeEmail, sendBookingConfirmationEmail, sendMembershipPurchaseEmail } from '@/lib/flowternity/email';
 
 function cors(res) {
@@ -58,6 +58,59 @@ async function seedKidLevels(db, { user_id, child_profile_id, sport_ids }) {
 
 function levelInfo(level) {
   return KIDS_LEVELS.find(l => l.level === Number(level)) || KIDS_LEVELS[0];
+}
+
+// Idempotent: activate a membership from a Razorpay order_id. Used by both
+// /checkout/verify (client-driven) and the /webhooks/razorpay (server-driven, race-proof).
+// Returns { alreadyProcessed, user_membership, payment }.
+async function activateOrderMembership(db, { razorpay_order_id, razorpay_payment_id, razorpay_signature = null, source = 'client' }) {
+  const paymentRec = await db.collection('payments').findOne({ razorpay_order_id });
+  if (!paymentRec) return { error: 'Order not found', status: 404 };
+  if (paymentRec.status === 'success') {
+    const existing = paymentRec.user_membership_id ? await db.collection('user_memberships').findOne({ id: paymentRec.user_membership_id }) : null;
+    return { alreadyProcessed: true, payment: paymentRec, user_membership: existing };
+  }
+  const mem = MEMBERSHIPS.find(m => m.id === paymentRec.membership_id);
+  if (!mem) return { error: 'Membership not found', status: 404 };
+  const user = await db.collection('users').findOne({ id: paymentRec.user_id });
+  if (!user) return { error: 'User not found', status: 404 };
+  const meta = paymentRec.pending_meta || {};
+  const now = new Date();
+  const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
+  const um = {
+    id: uuidv4(),
+    user_id: user.id,
+    child_profile_id: meta.child_profile_id || null,
+    membership_id: mem.id,
+    membership_snapshot: mem,
+    selected_sports: Array.isArray(meta.selected_sports) ? meta.selected_sports.slice(0, mem.max_sports || 99) : [],
+    start_date: now, expiry_date: expiry,
+    status: 'active', pause_days: 0, paused_at: null,
+    created_at: now,
+  };
+  await db.collection('user_memberships').insertOne(um);
+  await db.collection('payments').updateOne({ razorpay_order_id }, {
+    $set: {
+      status: 'success',
+      razorpay_payment_id,
+      ...(razorpay_signature ? { razorpay_signature } : {}),
+      ref: razorpay_payment_id,
+      user_membership_id: um.id,
+      verified_at: new Date(),
+      activation_source: source, // 'client' | 'webhook'
+    },
+  });
+  if (mem.category === 'kids' && meta.child_profile_id && um.selected_sports?.length) {
+    await seedKidLevels(db, { user_id: user.id, child_profile_id: meta.child_profile_id, sport_ids: um.selected_sports });
+  }
+  try {
+    await sendMembershipPurchaseEmail({
+      to: user.email, name: user.full_name,
+      membershipName: mem.name, months: mem.duration_months, price: mem.price, expiryDate: expiry,
+    });
+  } catch (e) { /* non-fatal */ }
+  const updatedPayment = await db.collection('payments').findOne({ razorpay_order_id });
+  return { alreadyProcessed: false, payment: updatedPayment, user_membership: um };
 }
 
 async function handleRoute(request, { params }) {
@@ -240,7 +293,7 @@ async function handleRoute(request, { params }) {
       }
     }
 
-    // 3) Verify signature and activate membership
+    // 3) Verify signature and activate membership (client-driven path)
     if (route === '/checkout/verify' && method === 'POST') {
       const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = await request.json();
       if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return err('Missing payment fields');
@@ -248,59 +301,95 @@ async function handleRoute(request, { params }) {
         await db.collection('payments').updateOne({ razorpay_order_id }, { $set: { status: 'failed', failure_reason: 'invalid_signature', updated_at: new Date() } });
         return err('Invalid signature', 400);
       }
-      const paymentRec = await db.collection('payments').findOne({ razorpay_order_id });
-      if (!paymentRec) return err('Order not found', 404);
-      if (paymentRec.status === 'success') {
-        // Idempotent - already processed
-        const existing = paymentRec.user_membership_id ? await db.collection('user_memberships').findOne({ id: paymentRec.user_membership_id }) : null;
-        return j({ ok: true, payment: clean(paymentRec), user_membership: existing ? clean(existing) : null, already_processed: true });
-      }
-      const mem = MEMBERSHIPS.find(m => m.id === paymentRec.membership_id);
-      if (!mem) return err('Membership not found', 404);
-      const meta = paymentRec.pending_meta || {};
-      const user = await db.collection('users').findOne({ id: paymentRec.user_id });
-      if (!user) return err('User not found', 404);
-
-      const now = new Date();
-      const expiry = new Date(now); expiry.setMonth(expiry.getMonth() + mem.duration_months);
-      const um = {
-        id: uuidv4(),
-        user_id: user.id,
-        child_profile_id: meta.child_profile_id || null,
-        membership_id: mem.id,
-        membership_snapshot: mem,
-        selected_sports: Array.isArray(meta.selected_sports) ? meta.selected_sports.slice(0, mem.max_sports || 99) : [],
-        start_date: now, expiry_date: expiry,
-        status: 'active', pause_days: 0, paused_at: null,
-        created_at: now,
-      };
-      await db.collection('user_memberships').insertOne(um);
-
-      await db.collection('payments').updateOne({ razorpay_order_id }, {
-        $set: {
-          status: 'success',
-          razorpay_payment_id, razorpay_signature,
-          ref: razorpay_payment_id,
-          user_membership_id: um.id,
-          verified_at: new Date(),
-        },
+      const result = await activateOrderMembership(db, {
+        razorpay_order_id, razorpay_payment_id, razorpay_signature, source: 'client',
       });
+      if (result.error) return err(result.error, result.status || 500);
+      return j({
+        ok: true,
+        payment: clean(result.payment),
+        user_membership: result.user_membership ? clean(result.user_membership) : null,
+        already_processed: result.alreadyProcessed,
+      });
+    }
 
-      // Seed kid levels for each selected sport
-      if (mem.category === 'kids' && meta.child_profile_id && um.selected_sports?.length) {
-        await seedKidLevels(db, { user_id: user.id, child_profile_id: meta.child_profile_id, sport_ids: um.selected_sports });
+    // -------- RAZORPAY WEBHOOK (public, server-to-server) --------
+    // Configure this URL in Razorpay Dashboard → Settings → Webhooks with a shared secret,
+    // then set RAZORPAY_WEBHOOK_SECRET in .env. This is the source-of-truth for
+    // activation — the client /checkout/verify is a UX nicety.
+    if (route === '/webhooks/razorpay' && method === 'POST') {
+      const rawBody = await request.text();
+      const signature = request.headers.get('x-razorpay-signature') || request.headers.get('X-Razorpay-Signature');
+      const check = verifyWebhookSignature(rawBody, signature);
+      if (!check.ok) {
+        console.warn('[razorpay-webhook] rejected:', check.reason);
+        return err('Invalid signature', 400);
       }
-
-      // Best-effort email
+      let payload;
+      try { payload = JSON.parse(rawBody); }
+      catch { return err('Invalid JSON', 400); }
+      const event = payload.event;
+      const payment = payload?.payload?.payment?.entity;
+      const refund = payload?.payload?.refund?.entity;
       try {
-        await sendMembershipPurchaseEmail({
-          to: user.email, name: user.full_name,
-          membershipName: mem.name, months: mem.duration_months, price: mem.price, expiryDate: expiry,
-        });
-      } catch (e) { /* non-fatal */ }
-
-      const updatedPayment = await db.collection('payments').findOne({ razorpay_order_id });
-      return j({ ok: true, payment: clean(updatedPayment), user_membership: clean(um) });
+        if (event === 'payment.captured' && payment) {
+          const orderId = payment.order_id;
+          const paymentId = payment.id;
+          if (orderId) {
+            const result = await activateOrderMembership(db, {
+              razorpay_order_id: orderId,
+              razorpay_payment_id: paymentId,
+              razorpay_signature: null,
+              source: 'webhook',
+            });
+            if (result.error) {
+              console.warn('[razorpay-webhook] activation error:', result.error);
+              // Return 200 anyway so Razorpay doesn't keep retrying for unknown orders (e.g., mock orders)
+              return j({ ok: true, note: result.error });
+            }
+          }
+        } else if (event === 'payment.failed' && payment) {
+          const orderId = payment.order_id;
+          if (orderId) {
+            await db.collection('payments').updateOne(
+              { razorpay_order_id: orderId, status: { $ne: 'success' } },
+              { $set: {
+                status: 'failed',
+                razorpay_payment_id: payment.id,
+                failure_reason: payment.error_description || payment.error_code || 'payment.failed',
+                updated_at: new Date(),
+                activation_source: 'webhook',
+              } }
+            );
+          }
+        } else if (event && event.startsWith('refund.') && refund) {
+          // Mark linked payment refunded if we haven't already (admin refund path also does this)
+          const paymentId = refund.payment_id;
+          if (paymentId) {
+            await db.collection('payments').updateOne(
+              { razorpay_payment_id: paymentId },
+              { $set: {
+                status: 'refunded',
+                refunded_at: new Date(),
+                refund_id: refund.id,
+                refund_status: refund.status,
+                updated_at: new Date(),
+              } }
+            );
+            const p = await db.collection('payments').findOne({ razorpay_payment_id: paymentId });
+            if (p?.user_membership_id) {
+              await db.collection('user_memberships').updateOne(
+                { id: p.user_membership_id },
+                { $set: { status: 'expired', refunded_at: new Date() } }
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[razorpay-webhook] handler error:', e);
+        // Still return 200 to prevent Razorpay retry storms — we've logged the issue
+      }
+      return j({ ok: true });
     }
 
     // -------- AUTH --------
@@ -1447,22 +1536,59 @@ async function handleRoute(request, { params }) {
         });
       }
 
-      // Refund a payment (marks refunded + expires linked membership)
+      // Refund a payment — calls Razorpay refund API if it was a real Razorpay payment,
+      // otherwise marks a mock/admin_granted record as refunded in DB only.
       const paymentRefundMatch = route.match(/^\/admin\/payments\/([^/]+)\/refund$/);
       if (paymentRefundMatch && method === 'POST') {
         const pid = paymentRefundMatch[1];
         const p = await db.collection('payments').findOne({ id: pid });
         if (!p) return err('Payment not found', 404);
         if (p.status === 'refunded') return err('Already refunded', 400);
+        let reason = '';
+        try { const body = await request.json(); reason = body?.reason || ''; } catch (e) { /* body optional */ }
+
+        let razorpayRefund = null;
+        if (p.method === 'razorpay' && p.razorpay_payment_id && p.status === 'success') {
+          try {
+            razorpayRefund = await refundPayment({
+              payment_id: p.razorpay_payment_id,
+              amountPaise: p.amount ? Math.round(p.amount * 100) : undefined,
+              notes: { reason: reason || 'admin_refund', admin_id: auth.user.id },
+            });
+          } catch (e) {
+            return err('Razorpay refund failed: ' + (e.error?.description || e.message), 502);
+          }
+        }
+
         await db.collection('payments').updateOne({ id: pid }, {
-          $set: { status: 'refunded', refunded_at: new Date(), refunded_by: auth.user.id }
+          $set: {
+            status: 'refunded',
+            refunded_at: new Date(),
+            refunded_by: auth.user.id,
+            refund_reason: reason,
+            ...(razorpayRefund ? {
+              refund_id: razorpayRefund.id,
+              refund_status: razorpayRefund.status,
+              refund_amount: razorpayRefund.amount,
+            } : {}),
+          },
         });
         if (p.user_membership_id) {
           await db.collection('user_memberships').updateOne({ id: p.user_membership_id }, {
-            $set: { status: 'expired', refunded_at: new Date() }
+            $set: { status: 'expired', refunded_at: new Date() },
           });
         }
-        return j({ ok: true });
+        // Audit
+        await db.collection('admin_audit').insertOne({
+          id: uuidv4(),
+          action: 'payment.refund',
+          admin_id: auth.user.id,
+          payment_id: pid,
+          razorpay_refund_id: razorpayRefund?.id || null,
+          reason,
+          at: new Date(),
+        });
+        return j({ ok: true, refund: razorpayRefund || { id: null, mock: true } });
       }
 
       // Grant membership manually to a user
