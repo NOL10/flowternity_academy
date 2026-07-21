@@ -3,6 +3,7 @@
 import { useEffect, useState, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
+import Script from 'next/script';
 import SiteNav from '@/components/site-nav';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -23,6 +24,7 @@ function CheckoutInner() {
   const isKids = plan?.category === 'kids';
 
   const [processing, setProcessing] = useState(false);
+  const [rzpReady, setRzpReady] = useState(false);
   const [account, setAccount] = useState({ full_name: '', email: '', phone: '', password: '', confirm: '' });
   const [child, setChild] = useState({ child_name: '', dob: '', gender: '' });
   const [selectedSports, setSelectedSports] = useState([]);
@@ -75,36 +77,39 @@ function CheckoutInner() {
   const pay = async () => {
     const problem = validate();
     if (problem) { toast.error(problem); return; }
+    if (!rzpReady || typeof window === 'undefined' || !window.Razorpay) {
+      toast.error('Payment library still loading. Try again in a moment.');
+      return;
+    }
 
     setProcessing(true);
     try {
-      // simulate payment gateway
-      await new Promise(r => setTimeout(r, 1200));
+      let orderData;
+      let child_profile_id = null;
 
       if (user) {
-        // Already signed in — just add membership via existing mock checkout
-        let child_profile_id = null;
+        // Signed-in user: optionally create child, then create Razorpay order
         if (isKids) {
           const cres = await fetch('/api/children', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
             body: JSON.stringify({ ...child, selected_sports: selectedSports })
           });
           const cdata = await cres.json();
-          if (!cres.ok) throw new Error(cdata.error);
+          if (!cres.ok) throw new Error(cdata.error || 'Failed to create child profile');
           child_profile_id = cdata.child.id;
         }
-        const res = await fetch('/api/checkout/mock', {
+        const ores = await fetch('/api/checkout/order', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
           body: JSON.stringify({
             membership_id: plan.id,
             child_profile_id,
-            selected_sports: isKids ? selectedSports : selectedSports,
+            selected_sports: selectedSports,
           }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error);
+        orderData = await ores.json();
+        if (!ores.ok) throw new Error(orderData.error || 'Failed to create order');
       } else {
-        // Register + pay in one call
+        // Register + pay
         const payload = {
           full_name: account.full_name,
           email: account.email,
@@ -115,29 +120,71 @@ function CheckoutInner() {
           selected_sports: selectedSports,
         };
         if (isKids) payload.child = child;
-
-        const res = await fetch('/api/checkout/register-and-pay', {
+        const ores = await fetch('/api/checkout/register-order', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
           body: JSON.stringify(payload),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          // If email already exists, guide the user
-          if (res.status === 409) {
-            toast.error(data.error);
+        orderData = await ores.json();
+        if (!ores.ok) {
+          if (ores.status === 409) {
+            toast.error(orderData.error);
             setTimeout(() => router.push(`/auth?mode=login&next=/checkout?plan=${plan.id}`), 800);
             setProcessing(false);
             return;
           }
-          throw new Error(data.error);
+          throw new Error(orderData.error || 'Failed to create order');
         }
       }
 
-      toast.success('Payment successful! Welcome to Flowternity.');
-      await refresh();
-      router.push('/dashboard?welcome=1');
+      // Open Razorpay Checkout
+      const options = {
+        key: orderData.key_id,
+        amount: orderData.amount,
+        currency: orderData.currency,
+        name: 'Flowternity',
+        description: `${plan.name} · ${plan.duration_months}M`,
+        order_id: orderData.order_id,
+        prefill: {
+          name: user?.full_name || account.full_name || '',
+          email: user?.email || account.email || '',
+          contact: user?.phone || account.phone || '',
+        },
+        theme: { color: '#000000' },
+        handler: async function (response) {
+          try {
+            const vres = await fetch('/api/checkout/verify', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+              body: JSON.stringify({
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+              }),
+            });
+            const vdata = await vres.json();
+            if (!vres.ok) throw new Error(vdata.error || 'Verification failed');
+            toast.success('Payment successful! Welcome to Flowternity.');
+            await refresh();
+            router.push('/dashboard?welcome=1');
+          } catch (e) {
+            toast.error(e.message || 'Verification failed');
+            setProcessing(false);
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            toast.info('Payment cancelled');
+            setProcessing(false);
+          },
+        },
+      };
+      const rzp = new window.Razorpay(options);
+      rzp.on('payment.failed', function (response) {
+        toast.error('Payment failed: ' + (response.error?.description || 'Unknown error'));
+        setProcessing(false);
+      });
+      rzp.open();
     } catch (e) {
-      toast.error(e.message || 'Payment failed');
+      toast.error(e.message || 'Checkout failed');
       setProcessing(false);
     }
   };
@@ -146,6 +193,11 @@ function CheckoutInner() {
 
   return (
     <div className="min-h-screen bg-background">
+      <Script
+        src="https://checkout.razorpay.com/v1/checkout.js"
+        strategy="afterInteractive"
+        onLoad={() => setRzpReady(true)}
+      />
       <SiteNav />
       <div className="container py-10 md:py-14 max-w-6xl">
         <div className="mb-8">
@@ -244,17 +296,25 @@ function CheckoutInner() {
             {/* Payment section */}
             <Card className="p-6 md:p-8 rounded-2xl">
               <div className="flex items-center gap-2 mb-1"><Lock className="w-5 h-5" /><h2 className="font-display font-bold text-2xl">Payment</h2></div>
-              <p className="text-sm text-muted-foreground mb-6">Secure mock checkout — Razorpay integration ready to plug in.</p>
-              <div className="space-y-4">
-                <div><Label>Cardholder name</Label><Input className="h-12 mt-1" placeholder="Name on card" defaultValue={user?.full_name || account.full_name} /></div>
-                <div><Label>Card number</Label><Input className="h-12 mt-1" placeholder="4242 4242 4242 4242" defaultValue="4242 4242 4242 4242" /></div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div><Label>Expiry</Label><Input className="h-12 mt-1" placeholder="MM/YY" defaultValue="12/28" /></div>
-                  <div><Label>CVV</Label><Input className="h-12 mt-1" placeholder="123" defaultValue="123" /></div>
+              <p className="text-sm text-muted-foreground mb-6">Secure checkout powered by Razorpay. UPI, cards, netbanking & wallets accepted.</p>
+              <div className="rounded-xl border p-5 bg-gradient-to-br from-secondary/40 to-transparent">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-semibold">Razorpay Secure Checkout</div>
+                    <div className="text-xs text-muted-foreground mt-1">You&apos;ll be prompted to complete payment in a secure modal.</div>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <ShieldCheck className="w-4 h-4" /> 256-bit SSL
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2 text-[11px]">
+                  {['UPI', 'Cards', 'Netbanking', 'Wallets', 'EMI'].map(m => (
+                    <span key={m} className="px-2.5 py-1 rounded-full bg-background border">{m}</span>
+                  ))}
                 </div>
               </div>
-              <div className="mt-6 flex items-center gap-2 text-xs text-muted-foreground">
-                <ShieldCheck className="w-3.5 h-3.5" /> Mock payment for MVP — no real charge will be made.
+              <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
+                <Info className="w-3.5 h-3.5" /> Test mode — use any Razorpay test card / UPI ID (success@razorpay).
               </div>
             </Card>
           </div>
@@ -280,9 +340,11 @@ function CheckoutInner() {
                 <span className="font-display font-black text-3xl">₹{plan.price.toLocaleString('en-IN')}</span>
               </div>
 
-              <Button onClick={pay} disabled={processing} className="w-full mt-6 h-14 bg-accent text-black hover:bg-accent/90 text-base font-semibold">
+              <Button onClick={pay} disabled={processing || !rzpReady} className="w-full mt-6 h-14 bg-accent text-black hover:bg-accent/90 text-base font-semibold">
                 {processing ? (
                   <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Processing…</>
+                ) : !rzpReady ? (
+                  <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Loading Razorpay…</>
                 ) : (
                   <><CreditCard className="w-5 h-5 mr-2" /> Pay ₹{plan.price.toLocaleString('en-IN')}</>
                 )}
